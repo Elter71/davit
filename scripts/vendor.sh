@@ -3,7 +3,8 @@
 # without a system-wide install. Downloads the official signed installer package
 # from the apple/container GitHub release and extracts its payload.
 #
-# Usage: scripts/vendor.sh [version]     (default: 1.3.1)
+# Usage: scripts/vendor.sh [version]     (default: the apple/container version
+#                                         Package.resolved pins, which the app links)
 #
 # Resulting layout (mirrors the official /usr/local install root):
 #   Vendor/container/bin/container
@@ -14,7 +15,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-VERSION="${1:-1.3.1}"
+VERSION="${1:-$(scripts/resolved-version.sh container)}"
 URL="https://github.com/apple/container/releases/download/${VERSION}/container-${VERSION}-installer-signed.pkg"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

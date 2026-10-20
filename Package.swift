@@ -7,6 +7,8 @@ let package = Package(
     dependencies: [
         // Pinned to the exact release matching the installed container-apiserver.
         // Client and daemon ship in lockstep; do not use `from:` here.
+        // Move with scripts/bump-container.sh: it keeps containerization at the
+        // version apple/container requires, and PlatformInstaller.pinnedVersion in step.
         .package(url: "https://github.com/apple/container.git", exact: "1.3.1"),
         .package(url: "https://github.com/apple/containerization.git", exact: "0.42.0"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),

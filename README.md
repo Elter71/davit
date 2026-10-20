@@ -124,7 +124,7 @@ Also available headless: `Davit platform install|remove|status`.
 To ship a fully self-contained app that works without the system installer:
 
 ```sh
-scripts/vendor.sh 1.0.0        # downloads the official signed .pkg, extracts payload into Vendor/container
+scripts/vendor.sh              # downloads the official signed .pkg for the pinned version, extracts payload into Vendor/container
 scripts/bundle.sh --vendor     # bundles it into the app
 ```
 
@@ -137,7 +137,13 @@ installed) always see the same containers.
 
 **Version pinning:** the SPM dependency on apple/container is pinned `exact:` (see `Package.swift`) to
 match the daemon; client and apiserver ship in lockstep and the XPC protocol is not a
-stable public API. When the installed platform updates, bump the pin and rebuild.
+stable public API. The same version is also `PlatformInstaller.pinnedVersion`, which
+picks the installer pkg Davit downloads. Move all of them at once, one release at a time:
+
+```sh
+scripts/bump-container.sh 1.4.1   # both SPM pins, the installer pin, Package.resolved, then swift build
+scripts/check-pins.sh             # CI runs this; fails if the pins disagree
+```
 
 Trade-offs of vendoring, for the record: the bundle grows by ~150 MB, you own the
 update cadence of the toolchain, and the launchd services are registered from inside

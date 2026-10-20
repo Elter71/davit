@@ -25,6 +25,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # Before the build: a mismatch compiles fine and only shows up as an app
+      # that installs a container platform it can't talk to.
+      - name: Check the apple/container pins agree
+        run: scripts/check-pins.sh
+
       - name: Select latest Xcode
         uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
         with:

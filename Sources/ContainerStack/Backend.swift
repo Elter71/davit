@@ -1513,6 +1513,7 @@ enum SystemConfigStore {
 /// root then hosts the launchd services exactly like a /usr/local install.
 enum PlatformInstaller {
     /// Must match the ContainerAPIClient version this app links (Package.swift pin).
+    /// scripts/bump-container.sh moves both; scripts/check-pins.sh fails CI if they differ.
     static let pinnedVersion = "1.3.1"
 
     /// `pinnedVersion` parsed — what resolution matches installs against.
