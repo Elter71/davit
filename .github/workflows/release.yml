@@ -101,7 +101,7 @@ jobs:
       # v8 defaults `digest-mismatch` to error rather than warn. That matters
       # here specifically: this job signs and notarizes a bundle it did not
       # build, so a corrupted handoff should fail loudly, not get a signature.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: unsigned-bundle
           path: handoff
