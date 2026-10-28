@@ -1,6 +1,7 @@
 import AppKit
 import ContainerAPIClient
 import ContainerResource
+import ContainerizationOCI
 import Foundation
 import Logging
 
@@ -193,37 +194,8 @@ enum Main {
             return
         }
         if args.count >= 2, args[1] == "build" {
-            // usage: build -t <tag> [-f <dockerfile>] [--no-cache] <context-dir>
-            var tag: String?, file: String?, noCache = false, context: String?
-            var i = 2
-            while i < args.count {
-                switch args[i] {
-                case "-t", "--tag": if i + 1 < args.count { tag = args[i + 1]; i += 1 }
-                case "-f", "--file": if i + 1 < args.count { file = args[i + 1]; i += 1 }
-                case "--no-cache": noCache = true
-                default: context = args[i]
-                }
-                i += 1
-            }
-            guard let tag, let context else {
-                FileHandle.standardError.write(Data("usage: build -t <tag> [-f <dockerfile>] [--no-cache] <context-dir>\n".utf8)); exit(2)
-            }
-            let contextDir = (context as NSString).expandingTildeInPath
-            let dockerfile = file.map { ($0 as NSString).expandingTildeInPath } ?? "\(contextDir)/Dockerfile"
-            let request = BuildService.Request(
-                contextDir: contextDir, dockerfilePath: dockerfile, tag: tag, noCache: noCache)
-            let semaphore = DispatchSemaphore(value: 0)
-            Task.detached {
-                do {
-                    let image = try await BuildService.build(request) { print($0) }
-                    print("build: ok — \(image)")
-                    exit(0)
-                } catch {
-                    let message = (error as? CLIError)?.message ?? String(describing: error)
-                    FileHandle.standardError.write(Data("build failed: \(message)\n".utf8)); exit(1)
-                }
-            }
-            semaphore.wait()
+            // docker-style image build — BuildCLI below.
+            BuildCLI.run(Array(args.dropFirst(2)))
             return
         }
         if args.count >= 2, args[1] == "run" {
@@ -1084,6 +1056,245 @@ enum RunCLI {
     }
 }
 
+/// `davit build` — docker-style image build. Same shape as RunCLI: a pure
+/// `parseArgs` the selftest drives directly, and a process-exiting `parse`
+/// around it (usage problems exit 2, build failures exit 1).
+enum BuildCLI {
+    static let usage = """
+    usage: build [flags] [CONTEXT]
+      -t, --tag <name>              image name; repeat to tag the result several times (required)
+      -f, --file <path>             Dockerfile (default: CONTEXT/Dockerfile)
+      --build-arg KEY[=value]       build-time variable; a bare KEY takes the value from the environment
+      -l, --label KEY=value         image label
+      --target <stage>              build up to this multi-stage target
+      --platform os/arch[/variant]  target platform; comma-separate or repeat for a multi-platform image
+      -a, --arch <arch>             target architecture (amd64|arm64); combined with --os
+      --os <os>                     target OS (only linux)
+      --no-cache                    don't use the build cache
+      --pull                        re-pull base images
+      -q, --quiet                   suppress build output; print only the image name (errors still show)
+      --help                        show this usage and exit
+      CONTEXT defaults to the current directory. --platform takes precedence
+      over --arch/--os; with neither, the host architecture is built.
+      docker build flags with no builder mapping (--secret, --ssh, --cache-from,
+      --output, --push, --network, ...) are rejected — see README
+    """
+
+    /// Real `docker build` flags the platform builder can't honor from here.
+    /// Rejected by name, like RunCLI.unsupported, so a script doesn't
+    /// silently lose a setting.
+    static let unsupported: Set<String> = [
+        "--secret", "--ssh", "--cache-from", "--cache-to", "-o", "--output", "--push", "--load",
+        "--network", "--add-host", "--iidfile", "--squash", "--isolation", "--shm-size",
+        "--ulimit", "--cgroup-parent", "--security-opt", "--memory", "-m", "--cpu-shares",
+        "--progress", "--builder", "--allow", "--attest", "--sbom", "--provenance",
+        "--metadata-file", "--annotation", "--build-context", "--call", "--check",
+    ]
+
+    struct Invocation {
+        var tags: [String] = []
+        var file: String? = nil
+        var context = "."
+        var buildArgs: [String] = []
+        var labels: [String] = []
+        var target = ""
+        var platforms: [String] = []    // raw --platform values, comma lists split
+        var arches: [String] = []
+        var oses: [String] = []
+        var noCache = false
+        var pull = false
+        var quiet = false
+    }
+
+    /// Thrown by `parseArgs` instead of exiting. `message == nil` prints the
+    /// usage only; `isHelp` marks `--help` (usage to stdout, exit 0).
+    struct ParseError: Error, Equatable {
+        let message: String?
+        var isHelp: Bool = false
+    }
+
+    /// Pure flag parsing: no I/O, no `exit()`. `environment` resolves bare
+    /// `--build-arg KEY` (docker parity: unset → the arg is dropped).
+    static func parseArgs(
+        _ args: [String], environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> Invocation {
+        var inv = Invocation()
+        var context: String? = nil
+        var i = 0
+        while i < args.count {
+            let raw = args[i]
+            var arg = raw
+            var inline: String? = nil
+            if raw.hasPrefix("--"), let eq = raw.firstIndex(of: "=") {
+                arg = String(raw[..<eq])
+                inline = String(raw[raw.index(after: eq)...])
+            }
+            func value() throws -> String {
+                if let v = inline { return v }
+                guard i + 1 < args.count else { throw ParseError(message: "flag \(arg) needs a value") }
+                i += 1
+                return args[i]
+            }
+            func noValue() throws {
+                guard inline == nil else { throw ParseError(message: "flag \(arg) takes no value") }
+            }
+            func list(_ v: String) -> [String] {
+                v.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            }
+            switch arg {
+            case "-t", "--tag": inv.tags.append(try value())
+            case "-f", "--file": inv.file = try value()
+            case "--build-arg":
+                let v = try value()
+                if v.contains("=") {
+                    inv.buildArgs.append(v)
+                } else if let env = environment[v] {
+                    inv.buildArgs.append("\(v)=\(env)")
+                }
+            case "-l", "--label":
+                let v = try value()
+                guard v.contains("=") else { throw ParseError(message: "invalid --label value: \(v) (want KEY=value)") }
+                inv.labels.append(v)
+            case "--target": inv.target = try value()
+            case "--platform": inv.platforms.append(contentsOf: list(try value()))
+            case "-a", "--arch": inv.arches.append(contentsOf: list(try value()))
+            case "--os": inv.oses.append(contentsOf: list(try value()))
+            case "--no-cache": try noValue(); inv.noCache = true
+            case "--pull": try noValue(); inv.pull = true
+            case "-q", "--quiet": try noValue(); inv.quiet = true
+            case "--help": try noValue(); throw ParseError(message: nil, isHelp: true)
+            default:
+                if unsupported.contains(arg) {
+                    throw ParseError(message: "docker build flag \(arg) has no equivalent on this platform's builder — remove it")
+                } else if raw.hasPrefix("-"), raw != "-" {
+                    throw ParseError(message: "unknown flag: \(raw)")
+                } else if raw == "-" {
+                    throw ParseError(message: "building from stdin (-) isn't supported; pass a context directory")
+                } else if context != nil {
+                    throw ParseError(message: "only one build context allowed (got \(context!) and \(raw))")
+                } else {
+                    context = raw
+                }
+            }
+            i += 1
+        }
+        guard !inv.tags.isEmpty else { throw ParseError(message: "-t/--tag is required") }
+        if let context { inv.context = context }
+        _ = try resolvePlatforms(inv)
+        return inv
+    }
+
+    /// The platforms to build: --platform wins over --arch × --os (upstream
+    /// `container build` semantics); neither → the host architecture.
+    /// Duplicates collapse, order is kept.
+    static func resolvePlatforms(_ inv: Invocation) throws -> [ContainerizationOCI.Platform] {
+        var specs: [String]
+        if !inv.platforms.isEmpty {
+            specs = inv.platforms
+        } else {
+            let oses = inv.oses.isEmpty ? ["linux"] : inv.oses
+            let arches = inv.arches.isEmpty ? [BuildService.defaultArch] : inv.arches
+            specs = oses.flatMap { os in arches.map { "\(os)/\($0)" } }
+        }
+        var result: [ContainerizationOCI.Platform] = []
+        for spec in specs {
+            guard let platform = try? ContainerizationOCI.Platform(from: spec) else {
+                throw ParseError(message: "invalid platform: \(spec) (want os/arch[/variant], e.g. linux/amd64)")
+            }
+            guard platform.os == "linux" else {
+                throw ParseError(message: "unsupported platform: \(spec) (the builder only targets linux)")
+            }
+            if !result.contains(platform) { result.append(platform) }
+        }
+        return result
+    }
+
+    /// The service-layer request for a parsed invocation. Relative paths
+    /// resolve against the current directory; -f is taken as given (docker
+    /// resolves it against the cwd, not the context).
+    static func request(for inv: Invocation) throws -> BuildService.Request {
+        let cwd = FileManager.default.currentDirectoryPath
+        func absolute(_ path: String) -> String {
+            let expanded = (path as NSString).expandingTildeInPath
+            return URL(fileURLWithPath: expanded, relativeTo: URL(fileURLWithPath: cwd, isDirectory: true))
+                .standardizedFileURL.path
+        }
+        let contextDir = absolute(inv.context)
+        return BuildService.Request(
+            contextDir: contextDir,
+            dockerfilePath: inv.file.map(absolute) ?? "\(contextDir)/Dockerfile",
+            tag: inv.tags[0],
+            additionalTags: Array(inv.tags.dropFirst()),
+            buildArgs: inv.buildArgs,
+            labels: inv.labels,
+            noCache: inv.noCache,
+            pull: inv.pull,
+            target: inv.target,
+            platforms: try resolvePlatforms(inv))
+    }
+
+    static func parse(_ args: [String]) -> Invocation {
+        do {
+            return try parseArgs(args)
+        } catch let error as ParseError {
+            if error.isHelp {
+                print(usage); exit(0)
+            }
+            let prefix = error.message.map { $0 + "\n" } ?? ""
+            FileHandle.standardError.write(Data((prefix + usage + "\n").utf8)); exit(2)
+        } catch {
+            FileHandle.standardError.write(Data((usage + "\n").utf8)); exit(2)
+        }
+    }
+
+    static func run(_ args: [String]) {
+        let inv = parse(args)
+        let output = CLIOutput(level: inv.quiet ? .quiet : .normal)
+        let semaphore = DispatchSemaphore(value: 0)
+        Task.detached {
+            do {
+                let request = try request(for: inv)
+                // BuildKit writes its output straight to stderr (the builder's
+                // own quiet mode hangs — see BuildService), so -q silences
+                // fd 2 for the build and restores it for the result/error.
+                let savedStderr = inv.quiet ? dup(STDERR_FILENO) : -1
+                if savedStderr >= 0 {
+                    let devNull = open("/dev/null", O_WRONLY)
+                    dup2(devNull, STDERR_FILENO)
+                    close(devNull)
+                }
+                func restoreStderr() {
+                    guard savedStderr >= 0 else { return }
+                    dup2(savedStderr, STDERR_FILENO)
+                    close(savedStderr)
+                }
+                let image: String
+                do {
+                    image = try await BuildService.build(request) { output.say($0) }
+                } catch {
+                    restoreStderr()
+                    throw error
+                }
+                restoreStderr()
+                if inv.quiet {
+                    // docker -q prints the image ID; the name is what this
+                    // platform's image store keys on.
+                    print(image)
+                } else {
+                    print("build: ok — \(([image] + request.additionalTags).joined(separator: ", "))")
+                }
+                exit(0)
+            } catch {
+                let message = (error as? CLIError)?.message
+                    ?? (error as? ParseError)?.message
+                    ?? String(describing: error)
+                FileHandle.standardError.write(Data("build failed: \(message)\n".utf8)); exit(1)
+            }
+        }
+        semaphore.wait()
+    }
+}
+
 /// `davit selftest` — exercises the XPC-backed service layer end to end against
 /// the live daemon: lists, volume create/delete, container run/stop/start/delete.
 enum SelfTest {
@@ -1378,6 +1589,71 @@ enum SelfTest {
             }
             guard LoggingConfig.parseLevel("bogus") == (.info, false) else {
                 throw CLIError(command: "selftest", message: "invalid DAVIT_LOG_LEVEL should fall back to info and flag ok=false")
+            }
+        }
+        await step("build: pure flag parsing (BuildCLI.parseArgs)") {
+            let full = try BuildCLI.parseArgs([
+                "-t", "app:1", "--tag=app:latest", "-f", "Dockerfile.dev", "--build-arg", "A=1",
+                "--build-arg", "FROM_ENV", "--build-arg", "UNSET_IN_ENV", "-l", "team=core",
+                "--target", "runtime", "--no-cache", "--pull", "-q", "ctx",
+            ], environment: ["FROM_ENV": "x y"])
+            guard full.tags == ["app:1", "app:latest"], full.file == "Dockerfile.dev", full.context == "ctx",
+                  full.buildArgs == ["A=1", "FROM_ENV=x y"], full.labels == ["team=core"],
+                  full.target == "runtime", full.noCache, full.pull, full.quiet
+            else { throw CLIError(command: "selftest", message: "build flags parsed wrong: \(full)") }
+
+            // Context defaults to the cwd; no flags → host arch only.
+            let bare = try BuildCLI.parseArgs(["-t", "app"])
+            guard bare.context == ".",
+                  try BuildCLI.resolvePlatforms(bare) == [BuildService.linuxPlatform(arch: BuildService.defaultArch)]
+            else { throw CLIError(command: "selftest", message: "build defaults wrong: \(bare)") }
+
+            // --platform: comma lists and repeats, duplicates collapse, and it
+            // wins over --arch.
+            let multi = try BuildCLI.parseArgs([
+                "-t", "app", "--platform", "linux/amd64,linux/arm64", "--platform", "linux/amd64", "--arch", "arm64",
+            ])
+            guard try BuildCLI.resolvePlatforms(multi).map(\.description) == ["linux/amd64", "linux/arm64"] else {
+                throw CLIError(command: "selftest", message: "multi-platform resolve wrong: \(try BuildCLI.resolvePlatforms(multi))")
+            }
+            let arches = try BuildCLI.parseArgs(["-t", "app", "-a", "amd64,arm64", "--os", "linux"])
+            guard try BuildCLI.resolvePlatforms(arches).map(\.description) == ["linux/amd64", "linux/arm64"] else {
+                throw CLIError(command: "selftest", message: "--arch × --os resolve wrong")
+            }
+
+            let request = try BuildCLI.request(for: full)
+            let cwd = FileManager.default.currentDirectoryPath
+            guard request.contextDir == URL(fileURLWithPath: cwd).appendingPathComponent("ctx").path,
+                  request.dockerfilePath == URL(fileURLWithPath: cwd).appendingPathComponent("Dockerfile.dev").path,
+                  request.tag == "app:1", request.additionalTags == ["app:latest"]
+            else { throw CLIError(command: "selftest", message: "build request wrong: \(request)") }
+
+            let rejected: [([String], String)] = [
+                (["ctx"], "-t/--tag is required"),
+                (["-t", "app", "--platform", "windows/amd64"], "unsupported platform: windows/amd64"),
+                (["-t", "app", "--platform", "nonsense"], "invalid platform: nonsense"),
+                (["-t", "app", "--secret", "id=x"], "--secret"),
+                (["-t", "app", "--bogus"], "unknown flag: --bogus"),
+                (["-t", "app", "a", "b"], "only one build context"),
+                (["-t", "app", "-l", "novalue"], "invalid --label value"),
+                (["-t", "app", "--no-cache=true"], "takes no value"),
+                (["-t"], "needs a value"),
+            ]
+            for (argv, expected) in rejected {
+                do {
+                    _ = try BuildCLI.parseArgs(argv)
+                    throw CLIError(command: "selftest", message: "build \(argv) was accepted")
+                } catch let e as BuildCLI.ParseError {
+                    guard e.message?.contains(expected) == true else {
+                        throw CLIError(command: "selftest", message: "build \(argv): message \(e.message ?? "nil"), want \(expected)")
+                    }
+                }
+            }
+            do {
+                _ = try BuildCLI.parseArgs(["--help"])
+                throw CLIError(command: "selftest", message: "build --help didn't signal help")
+            } catch let e as BuildCLI.ParseError {
+                guard e.isHelp else { throw CLIError(command: "selftest", message: "build --help isn't the help path") }
             }
         }
         await step("run: pure routing (RunCLI.parseArgs)") {
