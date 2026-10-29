@@ -434,6 +434,14 @@ enum ContainerService {
         }
     }
 
+    /// The local image's digest, or nil when it isn't in the store.
+    static func imageDigest(_ reference: String) async -> String? {
+        guard let config = try? await Backend.systemConfig(),
+              let image = try? await ClientImage.get(reference: reference, containerSystemConfig: config)
+        else { return nil }
+        return image.digest
+    }
+
     static func listNetworks() async throws -> [NetworkRecord] {
         try await NetworkClient().list().map(NetworkRecord.init(resource:))
     }
