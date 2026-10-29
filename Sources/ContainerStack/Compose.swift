@@ -590,6 +590,57 @@ enum Compose {
         if let user = svc["user"] as? String { process += ["--user", user] }
         if let workdir = svc["working_dir"] as? String { process += ["--workdir", workdir] }
 
+        // Keys that map 1:1 onto `container run` flags.
+        func strings(_ raw: Any?) -> [String] {
+            switch raw {
+            case let list as [Any]: return list.map(scalarString)
+            case let one?: return [scalarString(one)]
+            default: return []
+            }
+        }
+        func enabled(_ name: String) -> Bool {
+            guard let raw = svc[name] else { return false }
+            if let b = raw as? Bool { return b }
+            return scalarString(raw) == "true"
+        }
+        if enabled("tty") { process.append("--tty") }
+        if enabled("init") { management.append("--init") }
+        if enabled("read_only") {
+            management.append("--read-only")
+            // docker bind-mounts /etc/hosts; here the hosts sync writes it in
+            // the rootfs, which a read-only root refuses.
+            warnings.append("\(key): read_only — other service names won't resolve inside this container (its /etc/hosts can't be updated)")
+        }
+        for cap in strings(svc["cap_add"]) { management += ["--cap-add", cap] }
+        for cap in strings(svc["cap_drop"]) { management += ["--cap-drop", cap] }
+        for server in strings(svc["dns"]) { management += ["--dns", server] }
+        for domain in strings(svc["dns_search"]) { management += ["--dns-search", domain] }
+        for option in strings(svc["dns_opt"]) { management += ["--dns-option", option] }
+        for path in strings(svc["tmpfs"]) { management += ["--tmpfs", path] }
+        if let shm = svc["shm_size"] { management += ["--shm-size", scalarString(shm)] }
+        // labels: list (`K=v`) or map; the project label is appended last.
+        switch svc["labels"] {
+        case let list as [Any]:
+            for label in list.map(scalarString) { management += ["--label", label] }
+        case let map as [String: Any]:
+            for (k, v) in map.sorted(by: { $0.key < $1.key }) {
+                management += ["--label", v is NSNull ? "\(k)=" : "\(k)=\(scalarString(v))"]
+            }
+        default: break
+        }
+        // ulimits: `name: N` (soft = hard) or `name: {soft: N, hard: M}`.
+        if let ulimits = svc["ulimits"] as? [String: Any] {
+            for (name, raw) in ulimits.sorted(by: { $0.key < $1.key }) {
+                if let limits = raw as? [String: Any], let soft = limits["soft"], let hard = limits["hard"] {
+                    process += ["--ulimit", "\(name)=\(scalarString(soft)):\(scalarString(hard))"]
+                } else if !(raw is [String: Any]) {
+                    process += ["--ulimit", "\(name)=\(scalarString(raw))"]
+                } else {
+                    warnings.append("\(key): ulimits.\(name) needs both soft and hard — ignored")
+                }
+            }
+        }
+
         // ports: "H:C[/proto]" short form or long form mappings
         for port in svc["ports"] as? [Any] ?? [] {
             if let s = port as? String {
@@ -776,7 +827,8 @@ enum Compose {
             "image", "container_name", "environment", "env_file", "user", "working_dir",
             "ports", "volumes", "networks", "cpus", "mem_limit", "deploy", "command",
             "entrypoint", "depends_on", "profiles", "healthcheck", "stop_grace_period",
-            "stop_signal", "build", "platform",
+            "stop_signal", "build", "platform", "tty", "init", "read_only", "cap_add",
+            "cap_drop", "dns", "dns_search", "dns_opt", "tmpfs", "shm_size", "labels", "ulimits",
         ]
         for k in svc.keys.sorted() where !handled.contains(k) {
             warnings.append("\(key): \"\(k)\" is not supported — ignored")
