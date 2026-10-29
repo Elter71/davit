@@ -1272,12 +1272,16 @@ extension Compose {
     /// paths use the default no-op, so this changes no observable behavior there.
     typealias Diagnostic = @Sendable (String) -> Void
 
+    /// A build's log lines, per service. nil leaves BuildKit's output on the
+    /// process's stderr, uncaptured.
+    typealias BuildLog = @Sendable (_ service: String, _ line: String) -> Void
+
     /// Build and pull what `up` needs before anything starts, per each
     /// service's build: block, pull_policy and `buildMode`. Returns the
     /// services whose image was built or pulled here (a running container of
     /// theirs may now be on an outdated image).
     private static func prepareImages(
-        plan: Plan, buildMode: BuildMode,
+        plan: Plan, buildMode: BuildMode, buildLog: BuildLog?,
         diagnostic: @escaping Diagnostic,
         progress: @escaping @Sendable (StepKind, _ done: Bool) async -> Void
     ) async throws -> Set<String> {
@@ -1321,7 +1325,7 @@ extension Compose {
                     }
                 }
                 if shouldBuild {
-                    try await buildService(svc, build.request, diagnostic: diagnostic, progress: progress)
+                    try await buildService(svc, build.request, buildLog: buildLog, diagnostic: diagnostic, progress: progress)
                     fresh.insert(svc.service)
                 }
             } else {
@@ -1342,12 +1346,13 @@ extension Compose {
     }
 
     private static func buildService(
-        _ svc: ServicePlan, _ request: BuildService.Request,
+        _ svc: ServicePlan, _ request: BuildService.Request, buildLog: BuildLog?,
         diagnostic: @escaping Diagnostic,
         progress: @escaping @Sendable (StepKind, _ done: Bool) async -> Void
     ) async throws {
         await progress(.building(service: svc.service), false)
-        _ = try await BuildService.build(request) { diagnostic($0) }
+        let service = svc.service
+        _ = try await BuildService.build(request, log: buildLog.map { log in { log(service, $0) } }) { diagnostic($0) }
         await progress(.building(service: svc.service), true)
     }
 
@@ -1357,6 +1362,7 @@ extension Compose {
     @discardableResult
     static func build(
         plan: Plan, overrides: BuildOverrides = BuildOverrides(),
+        buildLog: BuildLog? = nil,
         diagnostic: @escaping Diagnostic = { _ in },
         progress: @escaping @Sendable (StepKind, _ done: Bool) async -> Void
     ) async throws -> [String] {
@@ -1367,7 +1373,7 @@ extension Compose {
             request.noCache = request.noCache || overrides.noCache
             request.pull = request.pull || overrides.pull
             request.buildArgs += overrides.args
-            try await buildService(svc, request, diagnostic: diagnostic, progress: progress)
+            try await buildService(svc, request, buildLog: buildLog, diagnostic: diagnostic, progress: progress)
             built.append(svc.service)
         }
         return built
@@ -1392,6 +1398,7 @@ extension Compose {
     static func up(
         plan: Plan,
         buildMode: BuildMode = .auto,
+        buildLog: BuildLog? = nil,
         diagnostic: @escaping Diagnostic = { _ in },
         onServiceTouched: @escaping @Sendable (String) -> Void = { _ in },
         onNetworkCreated: @escaping @Sendable (String) -> Void = { _ in },
@@ -1429,7 +1436,8 @@ extension Compose {
 
         // Images first, like docker: every needed build/pull happens before
         // anything starts. `fresh` = services whose image this up replaced.
-        let fresh = try await prepareImages(plan: plan, buildMode: buildMode, diagnostic: diagnostic, progress: progress)
+        let fresh = try await prepareImages(
+            plan: plan, buildMode: buildMode, buildLog: buildLog, diagnostic: diagnostic, progress: progress)
 
         // Containers present before this up. One snapshot is enough: each
         // service is visited once, and a container this up just created is

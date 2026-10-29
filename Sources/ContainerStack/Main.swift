@@ -306,21 +306,14 @@ struct CLIOutput {
     func warnErr(_ s: String) { if level != .quiet { FileHandle.standardError.write(Data("warning: \(s)\n".utf8)) } }
 }
 
-/// Runs `body` with fd 2 pointed at /dev/null when `silence` is set, and
-/// restores it afterwards, thrown or not. BuildKit writes its progress
-/// straight to stderr (the builder's own quiet mode hangs — see
-/// BuildService), so this is how a `-q` build goes quiet.
-func withSilencedStderr<T>(_ silence: Bool, _ body: () async throws -> T) async rethrows -> T {
-    guard silence else { return try await body() }
-    let saved = dup(STDERR_FILENO)
-    let devNull = open("/dev/null", O_WRONLY)
-    dup2(devNull, STDERR_FILENO)
-    close(devNull)
-    defer {
-        dup2(saved, STDERR_FILENO)
-        close(saved)
-    }
-    return try await body()
+/// Where a CLI build's log goes. BuildService captures BuildKit's stderr
+/// output while it builds (see StderrTap), so the lines are written to a
+/// duplicate of the real stderr taken up front — writing to fd 2 itself
+/// would feed them back into the capture. Quiet drops them.
+func buildLogSink(quiet: Bool) -> @Sendable (String) -> Void {
+    guard !quiet else { return { _ in } }
+    let realStderr = FileHandle(fileDescriptor: dup(STDERR_FILENO), closeOnDealloc: true)
+    return { line in realStderr.write(Data((line + "\n").utf8)) }
 }
 
 /// `davit compose <sub>` — shared CLI plumbing for every compose subcommand
@@ -482,6 +475,13 @@ enum ComposeCLI {
         return inv
     }
 
+    /// `<service> | <line>` on the real stderr, like docker compose's
+    /// per-service build output; nothing under --quiet.
+    private static func composeBuildLog(quiet: Bool) -> Compose.BuildLog {
+        let sink = buildLogSink(quiet: quiet)
+        return { service, line in sink("\(service) | \(line)") }
+    }
+
     static func run(_ args: [String]) {
         let inv = parse(args)
         let output = CLIOutput(level:
@@ -538,6 +538,7 @@ enum ComposeCLI {
                             up = try await Compose.up(
                                 plan: plan,
                                 buildMode: buildMode,
+                                buildLog: composeBuildLog(quiet: inv.flags.contains("quiet")),
                                 diagnostic: { output.verbose($0) },
                                 onServiceTouched: { touched.insert($0) },
                                 onNetworkCreated: { createdNetworks.insert($0) }
@@ -636,10 +637,12 @@ enum ComposeCLI {
                     for w in plan.warnings { output.warn(w) }
                     let overrides = Compose.BuildOverrides(
                         noCache: inv.flags.contains("no-cache"), pull: inv.flags.contains("pull"), args: inv.buildArgs)
-                    let built = try await withSilencedStderr(inv.flags.contains("quiet")) {
-                        try await Compose.build(plan: plan, overrides: overrides, diagnostic: { output.verbose($0) }) { step, done in
-                            if done { output.say("build: \(step.label) done") }
-                        }
+                    let built = try await Compose.build(
+                        plan: plan, overrides: overrides,
+                        buildLog: composeBuildLog(quiet: inv.flags.contains("quiet")),
+                        diagnostic: { output.verbose($0) }
+                    ) { step, done in
+                        if done { output.say("build: \(step.label) done") }
                     }
                     if built.isEmpty { output.say("compose build: no service has a build: section") }
                     output.say("compose build: ok")
@@ -1123,6 +1126,7 @@ enum BuildCLI {
       --os <os>                     target OS (only linux)
       --no-cache                    don't use the build cache
       --pull                        re-pull base images
+      --progress plain|quiet|auto   build log on stderr (plain, the default; auto = plain) or none
       -q, --quiet                   suppress build output; print only the image name (errors still show)
       --help                        show this usage and exit
       CONTEXT defaults to the current directory. --platform takes precedence
@@ -1138,7 +1142,7 @@ enum BuildCLI {
         "--secret", "--ssh", "--cache-from", "--cache-to", "-o", "--output", "--push", "--load",
         "--network", "--add-host", "--iidfile", "--squash", "--isolation", "--shm-size",
         "--ulimit", "--cgroup-parent", "--security-opt", "--memory", "-m", "--cpu-shares",
-        "--progress", "--builder", "--allow", "--attest", "--sbom", "--provenance",
+        "--builder", "--allow", "--attest", "--sbom", "--provenance",
         "--metadata-file", "--annotation", "--build-context", "--call", "--check",
     ]
 
@@ -1155,6 +1159,7 @@ enum BuildCLI {
         var noCache = false
         var pull = false
         var quiet = false
+        var progress = "plain"          // plain | quiet (auto = plain)
     }
 
     /// Thrown by `parseArgs` instead of exiting. `message == nil` prints the
@@ -1213,6 +1218,14 @@ enum BuildCLI {
             case "--no-cache": try noValue(); inv.noCache = true
             case "--pull": try noValue(); inv.pull = true
             case "-q", "--quiet": try noValue(); inv.quiet = true
+            case "--progress":
+                let v = try value()
+                switch v {
+                case "plain", "auto": inv.progress = "plain"
+                case "quiet": inv.progress = "quiet"
+                default:
+                    throw ParseError(message: "invalid --progress value: \(v) (want plain|quiet|auto; the builder's tty mode needs a terminal Davit doesn't hand it)")
+                }
             case "--help": try noValue(); throw ParseError(message: nil, isHelp: true)
             default:
                 if unsupported.contains(arg) {
@@ -1305,9 +1318,9 @@ enum BuildCLI {
         Task.detached {
             do {
                 let request = try request(for: inv)
-                let image = try await withSilencedStderr(inv.quiet) {
-                    try await BuildService.build(request) { output.say($0) }
-                }
+                let image = try await BuildService.build(
+                    request, log: buildLogSink(quiet: inv.quiet || inv.progress == "quiet")
+                ) { output.say($0) }
                 if inv.quiet {
                     // docker -q prints the image ID; the name is what this
                     // platform's image store keys on.
@@ -1686,6 +1699,34 @@ enum SelfTest {
                 throw CLIError(command: "selftest", message: "build --help didn't signal help")
             } catch let e as BuildCLI.ParseError {
                 guard e.isHelp else { throw CLIError(command: "selftest", message: "build --help isn't the help path") }
+            }
+        }
+        await step("build: stderr capture (StderrTap) splits lines and folds carriage returns") {
+            let captured = OutputLog()
+            let tap = StderrTap(onLine: { captured.append($0 + "\n") })
+            try tap.start()
+            FileHandle.standardError.write(Data("first\nprogress 10%\rprogress 100%\n\u{1B}[32mgreen\u{1B}[0m\nno newline".utf8))
+            tap.stop()
+            guard captured.text == "first\nprogress 100%\n\u{1B}[32mgreen\u{1B}[0m\nno newline\n" else {
+                throw CLIError(command: "selftest", message: "captured \(captured.text.debugDescription)")
+            }
+            // fd 2 is back: a write after stop must not reach the old tap.
+            FileHandle.standardError.write(Data("     (stderr restored)\n".utf8))
+            guard !captured.text.contains("restored") else {
+                throw CLIError(command: "selftest", message: "stderr not restored")
+            }
+            for (argv, want) in [(["-t", "x", "--progress", "quiet"], "quiet"), (["-t", "x", "--progress=auto"], "plain")] {
+                guard try BuildCLI.parseArgs(argv).progress == want else {
+                    throw CLIError(command: "selftest", message: "\(argv) progress != \(want)")
+                }
+            }
+            do {
+                _ = try BuildCLI.parseArgs(["-t", "x", "--progress", "tty"])
+                throw CLIError(command: "selftest", message: "--progress tty accepted")
+            } catch let e as BuildCLI.ParseError {
+                guard e.message?.contains("invalid --progress value") == true else {
+                    throw CLIError(command: "selftest", message: "--progress tty: \(e.message ?? "nil")")
+                }
             }
         }
         await step("run: pure routing (RunCLI.parseArgs)") {
@@ -3163,6 +3204,50 @@ enum SelfTest {
                 throw error
             }
             await cleanup()
+        }
+        await step("build: live log capture, cancel mid-build, then build again") {
+            let fm = FileManager.default
+            // Not under /tmp: the builder's file sync rejects those contexts.
+            let dir = fm.homeDirectoryForCurrentUser.appendingPathComponent(".davit-selftest-buildlog-\(UUID().uuidString)")
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer { try? fm.removeItem(at: dir) }
+            let tag = "davit-selftest-buildlog:latest"
+            try? await ContainerService.deleteImage(tag)  // a previous aborted run's
+            let dockerfile = dir.appendingPathComponent("Dockerfile")
+            try "FROM alpine:latest\nRUN echo started-\(UUID().uuidString) && sleep 120\n"
+                .write(to: dockerfile, atomically: true, encoding: .utf8)
+            let request = BuildService.Request(contextDir: dir.path, dockerfilePath: dockerfile.path, tag: tag, noCache: true)
+
+            let log = OutputLog()
+            let build = Task { try await BuildService.build(request, log: { log.append($0 + "\n") }) { _ in } }
+            let deadline = ContinuousClock.now + .seconds(240)
+            while !log.text.contains("started-"), ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(250))
+            }
+            guard log.text.contains("started-") else {
+                build.cancel()
+                throw CLIError(command: "selftest", message: "RUN output never reached the log: \(log.text.suffix(400))")
+            }
+            let cancelledAt = ContinuousClock.now
+            build.cancel()
+            do {
+                _ = try await build.value
+                throw CLIError(command: "selftest", message: "cancelled build succeeded")
+            } catch let e as CLIError where e.command == "selftest" {
+                throw e
+            } catch { /* expected */ }
+            guard ContinuousClock.now - cancelledAt < .seconds(30) else {
+                throw CLIError(command: "selftest", message: "cancel took \(ContinuousClock.now - cancelledAt) — the build ran on")
+            }
+
+            // The capture gate and fd 2 are free again: a quick build works.
+            try "FROM alpine:latest\nRUN echo second\n".write(to: dockerfile, atomically: true, encoding: .utf8)
+            let second = OutputLog()
+            _ = try await BuildService.build(request, log: { second.append($0 + "\n") }) { _ in }
+            try? await ContainerService.deleteImage(tag)
+            guard second.text.contains("second") else {
+                throw CLIError(command: "selftest", message: "second build's log missing RUN output: \(second.text.suffix(400))")
+            }
         }
         await step("compose: up → ps → down") {
             let names = ["davit-selftest-updown-one", "davit-selftest-updown-two"]

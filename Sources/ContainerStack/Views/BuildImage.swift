@@ -13,11 +13,14 @@ struct BuildImageSheet: View {
     @State private var noCache = false
     @State private var pullBase = false
     @State private var arch = BuildService.defaultArch  // "arm64" | "amd64"
+    @State private var target = ""
 
     @State private var working = false
     @State private var progressText = ""
     @State private var errorText: String?
     @State private var builtImage: String?
+    @State private var logLines: [String] = []
+    @State private var buildTask: Task<Void, Never>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -35,6 +38,8 @@ struct BuildImageSheet: View {
                     Button("Choose…") { chooseDockerfile() }
                 }
                 TextField("Tag (e.g. myapp:latest)", text: $tag)
+                    .textFieldStyle(.roundedBorder)
+                TextField("Target stage (optional)", text: $target)
                     .textFieldStyle(.roundedBorder)
                 Picker("Platform", selection: $arch) {
                     Text("Apple silicon (linux/arm64)").tag("arm64")
@@ -55,6 +60,28 @@ struct BuildImageSheet: View {
             .toggleStyle(.checkbox)
             .font(.callout)
 
+            if !logLines.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Build log").font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(logLines.joined(separator: "\n"), forType: .string)
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .help("Copy build log")
+                    }
+                    ConsoleView(lines: logLines)
+                        .frame(height: 240)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(.separator))
+                }
+            }
+
             if let builtImage {
                 Label("Built \(builtImage)", systemImage: "checkmark.circle.fill")
                     .font(.callout).foregroundStyle(.green)
@@ -70,7 +97,11 @@ struct BuildImageSheet: View {
                     Text(progressText).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer()
-                Button(builtImage != nil ? "Close" : "Cancel") { dismiss() }
+                if working {
+                    Button("Stop Build") { buildTask?.cancel() }
+                } else {
+                    Button(builtImage != nil ? "Close" : "Cancel") { dismiss() }
+                }
                 Button {
                     build()
                 } label: {
@@ -81,7 +112,8 @@ struct BuildImageSheet: View {
             }
         }
         .padding(20)
-        .frame(width: 520)
+        .frame(width: logLines.isEmpty ? 520 : 680)
+        .onDisappear { buildTask?.cancel() }
     }
 
     private func chooseContext() {
@@ -120,6 +152,7 @@ struct BuildImageSheet: View {
     private func build() {
         working = true
         errorText = nil
+        logLines = []
         progressText = "Starting…"
         let request = BuildService.Request(
             contextDir: (contextDir as NSString).expandingTildeInPath,
@@ -130,21 +163,48 @@ struct BuildImageSheet: View {
             buildArgs: buildArgs.filter { !$0.key.isEmpty }.map { "\($0.key)=\($0.value)" },
             noCache: noCache,
             pull: pullBase,
+            target: target.trimmingCharacters(in: .whitespaces),
             platforms: [BuildService.linuxPlatform(arch: arch)]
         )
-        Task {
+        // Lines arrive on the capture thread, often hundreds a second; they
+        // are buffered and published a few times a second instead.
+        let buffer = LineBuffer()
+        buildTask = Task {
+            let flusher = Task { @MainActor in
+                while !Task.isCancelled {
+                    logLines.append(contentsOf: buffer.drain())
+                    try? await Task.sleep(for: .milliseconds(150))
+                }
+            }
             do {
-                let image = try await BuildService.build(request) { text in
+                let image = try await BuildService.build(request, log: { buffer.append($0) }) { text in
                     await MainActor.run { progressText = text }
                 }
                 builtImage = image
                 await state.refreshAll()
-            } catch let e as CLIError {
-                errorText = e.message
             } catch {
-                errorText = error.localizedDescription
+                // A stop surfaces as whatever the builder's stream threw.
+                errorText = Task.isCancelled
+                    ? "Build stopped"
+                    : (error as? CLIError)?.message ?? error.localizedDescription
             }
+            flusher.cancel()
+            logLines.append(contentsOf: buffer.drain())
             working = false
+            buildTask = nil
         }
+    }
+}
+
+/// Lock-protected line buffer between the build-log capture thread and the UI.
+private final class LineBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [String] = []
+    func append(_ line: String) { lock.lock(); lines.append(line); lock.unlock() }
+    func drain() -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        let out = lines
+        lines = []
+        return out
     }
 }
