@@ -306,6 +306,23 @@ struct CLIOutput {
     func warnErr(_ s: String) { if level != .quiet { FileHandle.standardError.write(Data("warning: \(s)\n".utf8)) } }
 }
 
+/// Runs `body` with fd 2 pointed at /dev/null when `silence` is set, and
+/// restores it afterwards, thrown or not. BuildKit writes its progress
+/// straight to stderr (the builder's own quiet mode hangs — see
+/// BuildService), so this is how a `-q` build goes quiet.
+func withSilencedStderr<T>(_ silence: Bool, _ body: () async throws -> T) async rethrows -> T {
+    guard silence else { return try await body() }
+    let saved = dup(STDERR_FILENO)
+    let devNull = open("/dev/null", O_WRONLY)
+    dup2(devNull, STDERR_FILENO)
+    close(devNull)
+    defer {
+        dup2(saved, STDERR_FILENO)
+        close(saved)
+    }
+    return try await body()
+}
+
 /// `davit compose <sub>` — shared CLI plumbing for every compose subcommand
 /// (plan decision 12): one argv parser covering the common flags, per-
 /// subcommand extras, and the file-vs-service positional rule, plus the
@@ -316,9 +333,9 @@ struct CLIOutput {
 enum ComposeCLI {
     static let usage = """
     usage: compose <subcommand> [-f <file>] [--env-file <path>] [--profile <name>]... [--verbose|-q|--quiet] [service...]
-      subcommands: plan | up [-d|--detach] [--down-on-failure] | down [-v|--volumes] | ps
+      subcommands: plan | up [-d|--detach] [--down-on-failure] [--build|--no-build] | down [-v|--volumes] | ps
                    logs [-f|--follow] [--tail <n>] | stop | start | restart | pull
-                   exec <service> <command...>
+                   build [--no-cache] [--pull] [--build-arg KEY[=value]]... | exec <service> <command...>
     """
 
     struct Invocation {
@@ -330,16 +347,21 @@ enum ComposeCLI {
         var counts: [String: Int] = [:]  // canonical int flags: "tail"
         var services: [String] = []
         var command: [String] = []       // exec only: everything after the service
+        var buildArgs: [String] = []     // build only: --build-arg KEY=value
     }
 
     private static let subcommands: Set<String> = [
-        "plan", "up", "down", "ps", "logs", "stop", "start", "restart", "pull", "exec",
+        "plan", "up", "down", "ps", "logs", "stop", "start", "restart", "pull", "exec", "build",
     ]
 
     /// Per-subcommand flags, token → canonical name. These shadow the shared
     /// flags: for `logs`, -f means --follow, so its file flag is `--file` only.
     private static let boolFlags: [String: [String: String]] = [
-        "up": ["-d": "detach", "--detach": "detach", "--down-on-failure": "down-on-failure"],
+        "up": [
+            "-d": "detach", "--detach": "detach", "--down-on-failure": "down-on-failure",
+            "--build": "build", "--no-build": "no-build",
+        ],
+        "build": ["--no-cache": "no-cache", "--pull": "pull"],
         "down": ["-v": "volumes", "--volumes": "volumes"],
         "logs": ["-f": "follow", "--follow": "follow"],
     ]
@@ -402,6 +424,14 @@ enum ComposeCLI {
                 inv.envFile = (value() as NSString).expandingTildeInPath
             } else if arg == "--profile" {
                 inv.profiles.append(value())
+            } else if sub == "build", arg == "--build-arg" {
+                // docker parity: a bare KEY takes the value from the environment.
+                let v = value()
+                if v.contains("=") {
+                    inv.buildArgs.append(v)
+                } else if let env = ProcessInfo.processInfo.environment[v] {
+                    inv.buildArgs.append("\(v)=\(env)")
+                }
             } else if arg == "--verbose" {
                 guard inline == nil else { usageExit("flag \(arg) takes no value") }
                 inv.flags.insert("verbose")
@@ -441,6 +471,9 @@ enum ComposeCLI {
         }
         if inv.flags.contains("verbose"), inv.flags.contains("quiet") {
             usageExit("--verbose and -q/--quiet are mutually exclusive")
+        }
+        if inv.flags.contains("build"), inv.flags.contains("no-build") {
+            usageExit("--build and --no-build are mutually exclusive")
         }
         // COMPOSE_PROFILES is the fallback when no --profile was given (docker v2).
         if inv.profiles.isEmpty, let env = ProcessInfo.processInfo.environment["COMPOSE_PROFILES"] {
@@ -500,8 +533,11 @@ enum ComposeCLI {
                         let touched = TouchedServices()
                         let createdNetworks = TouchedServices()
                         do {
+                            let buildMode: Compose.BuildMode = inv.flags.contains("build")
+                                ? .always : (inv.flags.contains("no-build") ? .never : .auto)
                             up = try await Compose.up(
                                 plan: plan,
+                                buildMode: buildMode,
                                 diagnostic: { output.verbose($0) },
                                 onServiceTouched: { touched.insert($0) },
                                 onNetworkCreated: { createdNetworks.insert($0) }
@@ -592,6 +628,21 @@ enum ComposeCLI {
                     }
                     for w in warnings { output.warn(w) }
                     output.say("compose \(sub): ok")
+                case "build":
+                    verboseHeader()
+                    // Like docker: exactly the named services, no dependencies.
+                    let plan = try parsed.selecting(
+                        services: inv.services, activeProfiles: inv.profiles, includeDependencies: false)
+                    for w in plan.warnings { output.warn(w) }
+                    let overrides = Compose.BuildOverrides(
+                        noCache: inv.flags.contains("no-cache"), pull: inv.flags.contains("pull"), args: inv.buildArgs)
+                    let built = try await withSilencedStderr(inv.flags.contains("quiet")) {
+                        try await Compose.build(plan: plan, overrides: overrides, diagnostic: { output.verbose($0) }) { step, done in
+                            if done { output.say("build: \(step.label) done") }
+                        }
+                    }
+                    if built.isEmpty { output.say("compose build: no service has a build: section") }
+                    output.say("compose build: ok")
                 case "exec":
                     verboseHeader()
                     // Whole-file plan like logs/down — an existing container of
@@ -1254,28 +1305,9 @@ enum BuildCLI {
         Task.detached {
             do {
                 let request = try request(for: inv)
-                // BuildKit writes its output straight to stderr (the builder's
-                // own quiet mode hangs — see BuildService), so -q silences
-                // fd 2 for the build and restores it for the result/error.
-                let savedStderr = inv.quiet ? dup(STDERR_FILENO) : -1
-                if savedStderr >= 0 {
-                    let devNull = open("/dev/null", O_WRONLY)
-                    dup2(devNull, STDERR_FILENO)
-                    close(devNull)
+                let image = try await withSilencedStderr(inv.quiet) {
+                    try await BuildService.build(request) { output.say($0) }
                 }
-                func restoreStderr() {
-                    guard savedStderr >= 0 else { return }
-                    dup2(savedStderr, STDERR_FILENO)
-                    close(savedStderr)
-                }
-                let image: String
-                do {
-                    image = try await BuildService.build(request) { output.say($0) }
-                } catch {
-                    restoreStderr()
-                    throw error
-                }
-                restoreStderr()
                 if inv.quiet {
                     // docker -q prints the image ID; the name is what this
                     // platform's image store keys on.
@@ -2596,6 +2628,34 @@ enum SelfTest {
             // The argv must be one the run path itself accepts.
             _ = try ContainerService.parseRunFlags(s.processArgs + s.managementArgs + s.resourceArgs)
         }
+        await step("compose: pull_policy parsing") {
+            let plan = try Compose.parse(text: """
+            services:
+              a: { image: alpine:latest, pull_policy: always }
+              b: { image: alpine:latest, pull_policy: if_not_present }
+              c: { image: alpine:latest, pull_policy: daily }
+              d: { image: alpine:latest }
+              e: { build: ., pull_policy: build }
+              f: { image: alpine:latest, pull_policy: never }
+            """, projectName: "p", baseDir: "/proj")
+            let policies = Dictionary(uniqueKeysWithValues: plan.services.map { ($0.service, $0.pullPolicy) })
+            guard policies == ["a": .always, "b": .missing, "c": .missing, "d": .missing, "e": .build, "f": .never],
+                  plan.warnings == ["c: pull_policy daily is not supported — using missing"]
+            else { throw CLIError(command: "selftest", message: "pull_policy parsed wrong: \(policies) \(plan.warnings)") }
+            for (body, expected) in [
+                ("{ image: alpine, pull_policy: sometimes }", "invalid pull_policy"),
+                ("{ image: alpine, pull_policy: build }", "pull_policy: build but no build: section"),
+            ] {
+                do {
+                    _ = try Compose.parse(text: "services:\n  s: \(body)\n", projectName: "p")
+                    throw CLIError(command: "selftest", message: "compose accepted \(body)")
+                } catch let e as Compose.Error {
+                    guard e.localizedDescription.contains(expected) else {
+                        throw CLIError(command: "selftest", message: "\(body): \(e.localizedDescription), want \(expected)")
+                    }
+                }
+            }
+        }
         await step("compose: env_file + entrypoint") {
             let fm = FileManager.default
             let dir = fm.temporaryDirectory.appendingPathComponent("davit-selftest-envfile-\(UUID().uuidString)")
@@ -3016,6 +3076,87 @@ enum SelfTest {
                 let managed = hosts.split(separator: "\n").filter { $0.hasSuffix("# davit-compose") && $0.contains(" migrator ") }
                 guard managed.count == 1, managed[0].hasPrefix("\(newIP) ") else {
                     throw CLIError(command: "selftest", message: "managed migrator lines in db wrong: \(managed)")
+                }
+            } catch {
+                await cleanup()
+                throw error
+            }
+            await cleanup()
+        }
+        await step("compose: up builds only a missing image; --build recreates on a new image; compose build") {
+            let fm = FileManager.default
+            // Not under /tmp: the builder's file sync rejects those contexts.
+            let dir = fm.homeDirectoryForCurrentUser.appendingPathComponent(".davit-selftest-buildup-\(UUID().uuidString)")
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            let container = "davit-selftest-buildup-app"
+            func cleanup() async {
+                try? await ContainerService.delete(container, force: true)
+                // Delete takes the reference as stored: the tag is required.
+                try? await ContainerService.deleteImage("davit-selftest-buildup-app:latest")
+                try? fm.removeItem(at: dir)
+            }
+            await cleanup()
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            func dockerfile(_ version: String) throws {
+                try "FROM alpine:latest\nRUN echo \(version) > /v\nCMD [\"sleep\", \"300\"]\n"
+                    .write(to: dir.appendingPathComponent("Dockerfile"), atomically: true, encoding: .utf8)
+            }
+            let plan = try Compose.parse(text: """
+            name: davit-selftest-buildup
+            services:
+              app:
+                build: .
+            """, projectName: "ignored", baseDir: dir.path)
+            func builds(_ events: ProgressLog) -> Int {
+                events.all.filter { $0.0 == .building(service: "app") && $0.1 }.count
+            }
+            func runningDigest() async throws -> String? {
+                try await ContainerService.listContainers().first { $0.id == container }?.configuration.image?.digest
+            }
+            do {
+                // --no-build with nothing built: a clear error, nothing created.
+                do {
+                    _ = try await Compose.up(plan: plan, buildMode: .never) { _, _ in }
+                    throw CLIError(command: "selftest", message: "--no-build up without an image succeeded")
+                } catch Compose.Error.imageNotBuilt(service: "app", image: _) { /* expected */ }
+
+                try dockerfile("v1")
+                let first = ProgressLog()
+                _ = try await Compose.up(plan: plan) { first.append($0, $1) }
+                guard builds(first) == 1 else {
+                    throw CLIError(command: "selftest", message: "first up should build the missing image once: \(first.all)")
+                }
+                let v1 = try await runningDigest()
+
+                // The image exists now: a plain up builds nothing and reuses.
+                let second = ProgressLog()
+                let up2 = try await Compose.up(plan: plan) { second.append($0, $1) }
+                guard builds(second) == 0, up2.reused == ["app"] else {
+                    throw CLIError(command: "selftest", message: "second up rebuilt or recreated: \(second.all) reused \(up2.reused)")
+                }
+
+                // --build with a changed Dockerfile: rebuilt, and the running
+                // container is recreated on the new image.
+                try dockerfile("v2")
+                let third = ProgressLog()
+                let up3 = try await Compose.up(plan: plan, buildMode: .always) { third.append($0, $1) }
+                let v2 = try await runningDigest()
+                guard builds(third) == 1, up3.reused.isEmpty, v1 != nil, v2 != nil, v1 != v2 else {
+                    throw CLIError(command: "selftest", message: "--build didn't recreate on the new image: \(third.all) \(v1 ?? "nil") → \(v2 ?? "nil")")
+                }
+
+                // --build with nothing changed: rebuilt from cache, same image,
+                // so the container is kept.
+                let fourth = ProgressLog()
+                let up4 = try await Compose.up(plan: plan, buildMode: .always) { fourth.append($0, $1) }
+                guard builds(fourth) == 1, up4.reused == ["app"] else {
+                    throw CLIError(command: "selftest", message: "unchanged --build recreated the container: \(fourth.all) reused \(up4.reused)")
+                }
+
+                // compose build always builds, image present or not.
+                let built = try await Compose.build(plan: plan) { _, _ in }
+                guard built == ["app"] else {
+                    throw CLIError(command: "selftest", message: "compose build built \(built)")
                 }
             } catch {
                 await cleanup()

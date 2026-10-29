@@ -232,13 +232,17 @@ struct ComposeImportSheet: View {
                         if done {
                             // .waiting is transient — the checkmark grid only keys
                             // on volume/network/service steps.
-                            if case .waiting = step {} else if case .building = step {} else { completed.insert(step) }
+                            switch step {
+                            case .waiting, .building, .pulling: break
+                            default: completed.insert(step)
+                            }
                         } else {
                             switch step {
                             case .volume(let v): phase = .running("Creating volume \(v)…")
                             case .network(let n): phase = .running("Creating network \(n)…")
                             case .service(let s): phase = .running("Starting \(s)… (pulls the image if needed)")
                             case .building(let s): phase = .running("Building \(s)…")
+                            case .pulling(let s): phase = .running("Pulling \(s)…")
                             case .waiting(let s, let c):
                                 phase = .running("Waiting for \(s) (\(c.replacingOccurrences(of: "service_", with: "")))…")
                             }

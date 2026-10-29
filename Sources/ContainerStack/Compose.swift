@@ -29,6 +29,7 @@ enum Compose {
         var stopGracePeriod: Double? // seconds; nil = platform stop default
         var stopSignal: String?      // signal name or number — the daemon parses it
         var build: BuildSpec?        // when set, `up` builds this image first
+        var pullPolicy: PullPolicy = .missing
         var id: String { service }
 
         /// Equivalent `container run …` (what Davit performs over XPC).
@@ -60,6 +61,26 @@ enum Compose {
                 managementArgs[i] == flag && i + 1 < managementArgs.count ? managementArgs[i + 1] : nil
             }
         }
+    }
+
+    /// A service's `pull_policy:`. `missing` is the default (and what
+    /// `if_not_present` means); `build` always rebuilds on `up`.
+    enum PullPolicy: String {
+        case missing, always, never, build
+    }
+
+    /// How `up` treats services with a `build:` block: `auto` builds an image
+    /// that's missing (or whose pull_policy is build), `always` is `--build`,
+    /// `never` is `--no-build`.
+    enum BuildMode {
+        case auto, always, never
+    }
+
+    /// One-off overrides for `compose build`'s own flags.
+    struct BuildOverrides {
+        var noCache = false
+        var pull = false
+        var args: [String] = []      // KEY=value, appended after the file's
     }
 
     /// A compose `build:` block resolved to absolute paths + the tag to build.
@@ -127,6 +148,10 @@ enum Compose {
         case didNotComplete(service: String, exitCode: Int32?)
         case foreignContainer(name: String)
         case invalidPlatform(service: String, platform: String)
+        case invalidPullPolicy(service: String, value: String)
+        case buildPolicyWithoutBuild(service: String)
+        case imageNotBuilt(service: String, image: String)
+        case imageNotPresent(service: String, image: String)
         case platformNotBuilt(service: String, platform: String)
 
         var errorDescription: String? {
@@ -138,6 +163,14 @@ enum Compose {
             case .missingImage(let s): return "service \"\(s)\" has neither image: nor build:"
             case .invalidPlatform(let s, let p):
                 return "service \"\(s)\": invalid platform \(p.debugDescription) (want linux/<arch>[/variant], e.g. linux/amd64)"
+            case .invalidPullPolicy(let s, let v):
+                return "service \"\(s)\": invalid pull_policy \(v.debugDescription) (want always, missing, never or build)"
+            case .buildPolicyWithoutBuild(let s):
+                return "service \"\(s)\" has pull_policy: build but no build: section"
+            case .imageNotBuilt(let s, let i):
+                return "service \"\(s)\": image \(i) hasn't been built — run without --no-build, or `compose build \(s)`"
+            case .imageNotPresent(let s, let i):
+                return "service \"\(s)\": image \(i) isn't present locally and pull_policy is never"
             case .platformNotBuilt(let s, let p):
                 return "service \"\(s)\": platform \(p) must be one of its build.platforms"
             case .foreignContainer(let n):
@@ -822,6 +855,22 @@ enum Compose {
         }
         let stopSignal = svc["stop_signal"].map(scalarString)
 
+        // pull_policy: docker's names; the periodic ones (daily, weekly,
+        // every_<duration>) need pull bookkeeping this platform doesn't keep.
+        var pullPolicy = PullPolicy.missing
+        if let raw = svc["pull_policy"].map(scalarString) {
+            if raw == "if_not_present" {
+                pullPolicy = .missing
+            } else if let policy = PullPolicy(rawValue: raw) {
+                pullPolicy = policy
+            } else if raw == "daily" || raw == "weekly" || raw.hasPrefix("every_") {
+                warnings.append("\(key): pull_policy \(raw) is not supported — using missing")
+            } else {
+                throw Error.invalidPullPolicy(service: key, value: raw)
+            }
+            if pullPolicy == .build, buildSpec == nil { throw Error.buildPolicyWithoutBuild(service: key) }
+        }
+
         // Everything we understand is handled above; name the rest honestly.
         let handled: Set<String> = [
             "image", "container_name", "environment", "env_file", "user", "working_dir",
@@ -829,6 +878,7 @@ enum Compose {
             "entrypoint", "depends_on", "profiles", "healthcheck", "stop_grace_period",
             "stop_signal", "build", "platform", "tty", "init", "read_only", "cap_add",
             "cap_drop", "dns", "dns_search", "dns_opt", "tmpfs", "shm_size", "labels", "ulimits",
+            "pull_policy",
         ]
         for k in svc.keys.sorted() where !handled.contains(k) {
             warnings.append("\(key): \"\(k)\" is not supported — ignored")
@@ -842,7 +892,7 @@ enum Compose {
             processArgs: process, managementArgs: management,
             resourceArgs: resource, commandArgs: command,
             profiles: profiles, healthcheck: healthcheck, dependsOn: deps,
-            stopGracePeriod: stopGrace, stopSignal: stopSignal, build: buildSpec)
+            stopGracePeriod: stopGrace, stopSignal: stopSignal, build: buildSpec, pullPolicy: pullPolicy)
         return (plan, warnings)
     }
 
@@ -1202,6 +1252,7 @@ extension Compose {
         case volume(String), network(String), service(String)
         case waiting(service: String, condition: String)
         case building(service: String)
+        case pulling(service: String)
 
         /// Human-readable form for CLI progress lines.
         var label: String {
@@ -1209,6 +1260,7 @@ extension Compose {
             case .volume(let v): return "volume \(v)"
             case .network(let n): return "network \(n)"
             case .building(let s): return "building \(s)"
+            case .pulling(let s): return "pulling \(s)"
             case .service(let s): return "service \(s)"
             case .waiting(let s, let c): return "waiting \(s) (\(c))"
             }
@@ -1219,6 +1271,107 @@ extension Compose {
     /// CLI wires this to stdout under `--verbose`; the GUI and non-verbose CLI
     /// paths use the default no-op, so this changes no observable behavior there.
     typealias Diagnostic = @Sendable (String) -> Void
+
+    /// Build and pull what `up` needs before anything starts, per each
+    /// service's build: block, pull_policy and `buildMode`. Returns the
+    /// services whose image was built or pulled here (a running container of
+    /// theirs may now be on an outdated image).
+    private static func prepareImages(
+        plan: Plan, buildMode: BuildMode,
+        diagnostic: @escaping Diagnostic,
+        progress: @escaping @Sendable (StepKind, _ done: Bool) async -> Void
+    ) async throws -> Set<String> {
+        var fresh = Set<String>()
+        func present(_ svc: ServicePlan) async throws -> Bool {
+            try await ContainerService.imageExists(svc.image, managementArgs: svc.managementArgs)
+        }
+        func pull(_ svc: ServicePlan) async throws {
+            await progress(.pulling(service: svc.service), false)
+            try await ContainerService.pullImage(svc.image, platform: svc.platform) { _ in }
+            await progress(.pulling(service: svc.service), true)
+        }
+        for svc in plan.services {
+            if let build = svc.build {
+                var shouldBuild: Bool
+                switch buildMode {
+                case .never:
+                    guard try await present(svc) else {
+                        // An explicit image may still be pulled by the run path.
+                        if build.imageIsExplicit { continue }
+                        throw Error.imageNotBuilt(service: svc.service, image: svc.image)
+                    }
+                    continue
+                case .always:
+                    shouldBuild = true
+                case .auto:
+                    switch svc.pullPolicy {
+                    case .build: shouldBuild = true
+                    case .always:
+                        // docker: pull, and build when there's nothing to pull.
+                        do {
+                            try await pull(svc)
+                            fresh.insert(svc.service)
+                            shouldBuild = false
+                        } catch {
+                            diagnostic("\(svc.service): pull failed, building instead — \(error.localizedDescription)")
+                            shouldBuild = true
+                        }
+                    case .missing, .never:
+                        shouldBuild = try await !present(svc)
+                    }
+                }
+                if shouldBuild {
+                    try await buildService(svc, build.request, diagnostic: diagnostic, progress: progress)
+                    fresh.insert(svc.service)
+                }
+            } else {
+                switch svc.pullPolicy {
+                case .always:
+                    try await pull(svc)
+                    fresh.insert(svc.service)
+                case .never:
+                    guard try await present(svc) else {
+                        throw Error.imageNotPresent(service: svc.service, image: svc.image)
+                    }
+                case .missing, .build:
+                    break  // the run path pulls a missing image
+                }
+            }
+        }
+        return fresh
+    }
+
+    private static func buildService(
+        _ svc: ServicePlan, _ request: BuildService.Request,
+        diagnostic: @escaping Diagnostic,
+        progress: @escaping @Sendable (StepKind, _ done: Bool) async -> Void
+    ) async throws {
+        await progress(.building(service: svc.service), false)
+        _ = try await BuildService.build(request) { diagnostic($0) }
+        await progress(.building(service: svc.service), true)
+    }
+
+    /// `compose build`: build every service in the plan that has a build:
+    /// block (others are skipped, like docker), regardless of whether its
+    /// image exists. Returns the services built.
+    @discardableResult
+    static func build(
+        plan: Plan, overrides: BuildOverrides = BuildOverrides(),
+        diagnostic: @escaping Diagnostic = { _ in },
+        progress: @escaping @Sendable (StepKind, _ done: Bool) async -> Void
+    ) async throws -> [String] {
+        var built: [String] = []
+        for svc in plan.services {
+            guard let build = svc.build else { continue }
+            var request = build.request
+            request.noCache = request.noCache || overrides.noCache
+            request.pull = request.pull || overrides.pull
+            request.buildArgs += overrides.args
+            try await buildService(svc, request, diagnostic: diagnostic, progress: progress)
+            built.append(svc.service)
+        }
+        return built
+    }
 
     /// Bring the plan up: create missing named volumes and networks, then create
     /// and start each service in dependency order, honoring depends_on conditions
@@ -1238,6 +1391,7 @@ extension Compose {
     /// an earlier up, is responsible for tearing down.
     static func up(
         plan: Plan,
+        buildMode: BuildMode = .auto,
         diagnostic: @escaping Diagnostic = { _ in },
         onServiceTouched: @escaping @Sendable (String) -> Void = { _ in },
         onNetworkCreated: @escaping @Sendable (String) -> Void = { _ in },
@@ -1273,6 +1427,10 @@ extension Compose {
         })
         let byService = Dictionary(uniqueKeysWithValues: plan.services.map { ($0.service, $0) })
 
+        // Images first, like docker: every needed build/pull happens before
+        // anything starts. `fresh` = services whose image this up replaced.
+        let fresh = try await prepareImages(plan: plan, buildMode: buildMode, diagnostic: diagnostic, progress: progress)
+
         // Containers present before this up. One snapshot is enough: each
         // service is visited once, and a container this up just created is
         // never looked up again. A failed list = nothing preexists.
@@ -1290,11 +1448,21 @@ extension Compose {
             }
             // Already running under the target name (and ours) → reuse as-is;
             // its dependencies were satisfied when it started, so skip the waits.
-            if preexisting[svc.name]?.isRunning == true {
-                reused.insert(svc.service)
-                await progress(.service(svc.service), false)
-                await progress(.service(svc.service), true)
-                continue
+            // Unless this up just built or pulled a different image for it:
+            // then it's recreated, as docker does.
+            var staleImage = false
+            if let record = preexisting[svc.name], record.isRunning {
+                if fresh.contains(svc.service),
+                   let current = await ContainerService.imageDigest(svc.image),
+                   current != record.configuration.image?.digest {
+                    diagnostic("\(svc.service): image changed — recreating")
+                    staleImage = true
+                } else {
+                    reused.insert(svc.service)
+                    await progress(.service(svc.service), false)
+                    await progress(.service(svc.service), true)
+                    continue
+                }
             }
 
             for (dep, condition) in svc.dependsOn.sorted(by: { $0.key < $1.key }) where condition != .started {
@@ -1319,14 +1487,10 @@ extension Compose {
 
             await progress(.service(svc.service), false)
             diagnostic("\(svc.service): \(svc.cliPreview)")
-            if let build = svc.build {
-                await progress(.building(service: svc.service), false)
-                _ = try await BuildService.build(build.request) { diagnostic($0) }
-                await progress(.building(service: svc.service), true)
-            }
-            if let record = preexisting[svc.name], !record.isRunning {
-                // Ours, but not running (stopped, or created-but-start-failed) —
-                // recreate from the current plan rather than diffing config.
+            if let record = preexisting[svc.name], !record.isRunning || staleImage {
+                // Ours, but not running (stopped, or created-but-start-failed),
+                // or running an image this up replaced — recreate from the
+                // current plan rather than diffing config.
                 try await ContainerService.delete(svc.name, force: true)
             }
             // The run path auto-pulls a missing image; reuse pull's own tracker
@@ -1587,7 +1751,7 @@ extension Compose {
         for svc in plan.services {
             // docker compose skips build-only services: their image only
             // exists once `up` builds it.
-            if let build = svc.build, !build.imageIsExplicit {
+            if let build = svc.build, !build.imageIsExplicit || svc.pullPolicy == .build {
                 output("pull: \(svc.service) is built locally — skipped\n")
                 continue
             }
