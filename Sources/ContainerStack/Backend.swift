@@ -658,12 +658,16 @@ enum ContainerService {
 
     // MARK: Images
 
-    static func pullImage(_ reference: String, progress: @escaping @Sendable ([ProgressUpdateEvent]) async -> Void) async throws {
+    static func pullImage(
+        _ reference: String, platform: String? = nil,
+        progress: @escaping @Sendable ([ProgressUpdateEvent]) async -> Void
+    ) async throws {
         do {
             await DockerCredentialHelpers.refreshCredentials(forReference: reference)
             let config = try await Backend.systemConfig()
             _ = try await ClientImage.pull(
                 reference: reference,
+                platform: try platform.map { try Platform(from: $0) },
                 containerSystemConfig: config,
                 progressUpdate: progress
             )

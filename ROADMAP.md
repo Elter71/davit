@@ -61,7 +61,8 @@ remaining A item is #2 (file browsing), intentionally scheduled in Wave 2.
   depends_on (incl. service_healthy / service_completed_successfully conditions),
   healthcheck, profiles, stop_grace_period/stop_signal, `.env` + `${VAR}`
   interpolation; in-container service-name resolution via managed /etc/hosts
-  entries. `build:` not yet.
+  entries. `build:` (context/dockerfile/dockerfile_inline/args/labels/target/
+  platforms/tags/no_cache/pull) and service `platform:` are supported too.
   Headless: `Davit compose plan|up|down|ps|logs|stop|start|restart|pull|exec` with
   docker-style file autodiscovery, service selection and profiles; parser and
   lifecycle covered by selftest steps.

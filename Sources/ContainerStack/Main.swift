@@ -1198,11 +1198,11 @@ enum BuildCLI {
         }
         var result: [ContainerizationOCI.Platform] = []
         for spec in specs {
-            guard let platform = try? ContainerizationOCI.Platform(from: spec) else {
+            guard let platform = BuildService.platform(spec) else {
+                if let parsed = try? ContainerizationOCI.Platform(from: spec), parsed.os != "linux" {
+                    throw ParseError(message: "unsupported platform: \(spec) (the builder only targets linux)")
+                }
                 throw ParseError(message: "invalid platform: \(spec) (want os/arch[/variant], e.g. linux/amd64)")
-            }
-            guard platform.os == "linux" else {
-                throw ParseError(message: "unsupported platform: \(spec) (the builder only targets linux)")
             }
             if !result.contains(platform) { result.append(platform) }
         }
@@ -2456,20 +2456,86 @@ enum SelfTest {
             guard let str = byName["fromstr"]?.build else {
                 throw CLIError(command: "selftest", message: "string build: not parsed")
             }
+            // Build-only images are named <project>-<service>, like docker compose.
             guard str.context == "/proj/svc", str.dockerfile == "/proj/svc/Dockerfile",
-                  str.tag == "fromstr:latest" else {
+                  str.tag == "davit-selftest-build-fromstr", !str.imageIsExplicit,
+                  byName["fromstr"]?.image == "davit-selftest-build-fromstr" else {
                 throw CLIError(command: "selftest", message: "string build resolved wrong: \(str)")
             }
             guard let map = byName["frommap"]?.build else {
                 throw CLIError(command: "selftest", message: "map build: not parsed")
             }
             guard map.context == "/proj/ctx", map.dockerfile == "/proj/ctx/Dockerfile.dev",
-                  map.tag == "myorg/app:1.2", map.args == ["FOO=bar"],
+                  map.tag == "myorg/app:1.2", map.args == ["FOO=bar"], map.imageIsExplicit,
                   byName["frommap"]?.image == "myorg/app:1.2" else {
                 throw CLIError(command: "selftest", message: "map build resolved wrong: \(map), image \(byName["frommap"]?.image ?? "nil")")
             }
             guard byName["buildandnothing"]?.build == nil else {
                 throw CLIError(command: "selftest", message: "image-only service got a spurious build spec")
+            }
+        }
+        await step("compose: build: target/platforms/labels/tags/inline + service platform") {
+            let plan = try Compose.parse(text: """
+            name: davit-selftest-buildkeys
+            services:
+              full:
+                platform: linux/amd64
+                build:
+                  context: .
+                  dockerfile_inline: |
+                    FROM alpine
+                  target: runtime
+                  args: { A: "1", FROM_ENV: null, UNSET_ARG: null }
+                  labels: [team=core, bare]
+                  no_cache: true
+                  pull: true
+                  tags: [extra:1, extra:2]
+                  platforms: [linux/amd64, linux/arm64]
+                  network: default
+                  secrets: [token]
+                  cache_from: [type=local,src=/tmp]
+              impliedplatform:
+                platform: linux/amd64
+                build: .
+            """, projectName: "ignored", baseDir: "/proj", environment: ["FROM_ENV": "env value"])
+            let byName = Dictionary(uniqueKeysWithValues: plan.services.map { ($0.service, $0) })
+            guard let full = byName["full"], let b = full.build else {
+                throw CLIError(command: "selftest", message: "build keys: service not parsed")
+            }
+            guard b.dockerfileInline == "FROM alpine\n", b.target == "runtime",
+                  b.args == ["A=1", "FROM_ENV=env value"], b.labels == ["team=core", "bare="],
+                  b.noCache, b.pull, b.tags == ["extra:1", "extra:2"],
+                  b.platforms == ["linux/amd64", "linux/arm64"]
+            else { throw CLIError(command: "selftest", message: "build keys parsed wrong: \(b)") }
+            let request = b.request
+            guard request.dockerfileContents == Data("FROM alpine\n".utf8), request.additionalTags == ["extra:1", "extra:2"],
+                  request.platforms.map(\.description) == ["linux/amd64", "linux/arm64"], request.target == "runtime"
+            else { throw CLIError(command: "selftest", message: "build request wrong: \(request)") }
+            // platform: reaches the run, and defaults the build platform.
+            guard full.platform == "linux/amd64", full.cliPreview.contains("--platform linux/amd64"),
+                  byName["impliedplatform"]?.build?.platforms == ["linux/amd64"]
+            else { throw CLIError(command: "selftest", message: "service platform wrong: \(full.cliPreview)") }
+            // Unsupported build keys are named, `network: default` is not, and
+            // the handled ones (platform included) don't warn.
+            let warned = plan.warnings.filter { $0.hasPrefix("full:") }
+            guard warned.count == 2, warned.contains(where: { $0.contains("build.secrets") }),
+                  warned.contains(where: { $0.contains("build.cache_from") })
+            else { throw CLIError(command: "selftest", message: "build key warnings wrong: \(plan.warnings)") }
+
+            let rejected: [(String, String)] = [
+                ("platform: linux/arm64\n    build: { context: ., platforms: [linux/amd64] }", "must be one of its build.platforms"),
+                ("platform: windows/amd64\n    build: .", "invalid platform"),
+                ("build: { context: ., platforms: [bogus] }", "invalid platform"),
+            ]
+            for (body, expected) in rejected {
+                do {
+                    _ = try Compose.parse(text: "services:\n  s:\n    \(body)\n", projectName: "p", baseDir: "/proj")
+                    throw CLIError(command: "selftest", message: "compose accepted: \(body)")
+                } catch let e as Compose.Error {
+                    guard e.localizedDescription.contains(expected) else {
+                        throw CLIError(command: "selftest", message: "compose \(body): \(e.localizedDescription), want \(expected)")
+                    }
+                }
             }
         }
         await step("compose: env_file + entrypoint") {
