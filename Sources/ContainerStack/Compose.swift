@@ -43,6 +43,9 @@ enum Compose {
         /// Paired `--network` values — the networks this service attaches to.
         var networkRefs: [String] { paired("--network") }
 
+        /// The service's `platform:` (its `--platform` run flag), if set.
+        var platform: String? { paired("--platform").last }
+
         /// Named-volume sources of `--mount type=volume,…` specs.
         var volumeRefs: [String] {
             paired("--mount").compactMap { spec in
@@ -65,6 +68,14 @@ enum Compose {
         var dockerfile: String     // absolute
         var tag: String            // image ref to produce
         var args: [String]         // KEY=value
+        var dockerfileInline: String? = nil  // dockerfile_inline; wins over `dockerfile`
+        var target: String = ""
+        var labels: [String] = []  // KEY=value
+        var noCache = false
+        var pull = false
+        var platforms: [String] = []  // empty = the service platform, else the host's
+        var tags: [String] = []    // extra names for the built image (build.tags)
+        var imageIsExplicit = false   // service has its own image: (pull may fetch it)
     }
 
     struct Plan: Identifiable {
@@ -115,6 +126,8 @@ enum Compose {
         case dependencyExited(service: String)
         case didNotComplete(service: String, exitCode: Int32?)
         case foreignContainer(name: String)
+        case invalidPlatform(service: String, platform: String)
+        case platformNotBuilt(service: String, platform: String)
 
         var errorDescription: String? {
             switch self {
@@ -123,6 +136,10 @@ enum Compose {
             case .invalidServiceName(let s):
                 return "service name \(s.debugDescription) is invalid — only [a-zA-Z0-9._-] is allowed"
             case .missingImage(let s): return "service \"\(s)\" has neither image: nor build:"
+            case .invalidPlatform(let s, let p):
+                return "service \"\(s)\": invalid platform \(p.debugDescription) (want linux/<arch>[/variant], e.g. linux/amd64)"
+            case .platformNotBuilt(let s, let p):
+                return "service \"\(s)\": platform \(p) must be one of its build.platforms"
             case .foreignContainer(let n):
                 return "container \"\(n)\" exists but was not created by this compose project (missing \(Compose.projectLabel) label) — delete or rename it, then run up again"
             case .dependencyCycle(let names): return "depends_on cycle: \(names.joined(separator: " → "))"
@@ -460,8 +477,16 @@ enum Compose {
         // image OR build (docker allows build-only; with both, image is the
         // tag the build produces).
         let explicitImage = (svc["image"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        let buildSpec = try parseBuild(svc["build"], service: key, project: key,
-                                       image: explicitImage, baseDir: baseDir, warnings: &warnings)
+        // platform: the run's --platform, and the default build platform.
+        var platform: String? = nil
+        if let raw = svc["platform"] {
+            let spec = scalarString(raw)
+            guard BuildService.platform(spec) != nil else { throw Error.invalidPlatform(service: key, platform: spec) }
+            platform = spec
+        }
+        let buildSpec = try parseBuild(svc["build"], service: key, project: project,
+                                       image: explicitImage, platform: platform, baseDir: baseDir,
+                                       environment: environment, warnings: &warnings)
         guard let image = explicitImage ?? buildSpec?.tag else {
             throw Error.missingImage(service: key)
         }
@@ -564,6 +589,57 @@ enum Compose {
 
         if let user = svc["user"] as? String { process += ["--user", user] }
         if let workdir = svc["working_dir"] as? String { process += ["--workdir", workdir] }
+
+        // Keys that map 1:1 onto `container run` flags.
+        func strings(_ raw: Any?) -> [String] {
+            switch raw {
+            case let list as [Any]: return list.map(scalarString)
+            case let one?: return [scalarString(one)]
+            default: return []
+            }
+        }
+        func enabled(_ name: String) -> Bool {
+            guard let raw = svc[name] else { return false }
+            if let b = raw as? Bool { return b }
+            return scalarString(raw) == "true"
+        }
+        if enabled("tty") { process.append("--tty") }
+        if enabled("init") { management.append("--init") }
+        if enabled("read_only") {
+            management.append("--read-only")
+            // docker bind-mounts /etc/hosts; here the hosts sync writes it in
+            // the rootfs, which a read-only root refuses.
+            warnings.append("\(key): read_only — other service names won't resolve inside this container (its /etc/hosts can't be updated)")
+        }
+        for cap in strings(svc["cap_add"]) { management += ["--cap-add", cap] }
+        for cap in strings(svc["cap_drop"]) { management += ["--cap-drop", cap] }
+        for server in strings(svc["dns"]) { management += ["--dns", server] }
+        for domain in strings(svc["dns_search"]) { management += ["--dns-search", domain] }
+        for option in strings(svc["dns_opt"]) { management += ["--dns-option", option] }
+        for path in strings(svc["tmpfs"]) { management += ["--tmpfs", path] }
+        if let shm = svc["shm_size"] { management += ["--shm-size", scalarString(shm)] }
+        // labels: list (`K=v`) or map; the project label is appended last.
+        switch svc["labels"] {
+        case let list as [Any]:
+            for label in list.map(scalarString) { management += ["--label", label] }
+        case let map as [String: Any]:
+            for (k, v) in map.sorted(by: { $0.key < $1.key }) {
+                management += ["--label", v is NSNull ? "\(k)=" : "\(k)=\(scalarString(v))"]
+            }
+        default: break
+        }
+        // ulimits: `name: N` (soft = hard) or `name: {soft: N, hard: M}`.
+        if let ulimits = svc["ulimits"] as? [String: Any] {
+            for (name, raw) in ulimits.sorted(by: { $0.key < $1.key }) {
+                if let limits = raw as? [String: Any], let soft = limits["soft"], let hard = limits["hard"] {
+                    process += ["--ulimit", "\(name)=\(scalarString(soft)):\(scalarString(hard))"]
+                } else if !(raw is [String: Any]) {
+                    process += ["--ulimit", "\(name)=\(scalarString(raw))"]
+                } else {
+                    warnings.append("\(key): ulimits.\(name) needs both soft and hard — ignored")
+                }
+            }
+        }
 
         // ports: "H:C[/proto]" short form or long form mappings
         for port in svc["ports"] as? [Any] ?? [] {
@@ -751,12 +827,14 @@ enum Compose {
             "image", "container_name", "environment", "env_file", "user", "working_dir",
             "ports", "volumes", "networks", "cpus", "mem_limit", "deploy", "command",
             "entrypoint", "depends_on", "profiles", "healthcheck", "stop_grace_period",
-            "stop_signal", "build",
+            "stop_signal", "build", "platform", "tty", "init", "read_only", "cap_add",
+            "cap_drop", "dns", "dns_search", "dns_opt", "tmpfs", "shm_size", "labels", "ulimits",
         ]
         for k in svc.keys.sorted() where !handled.contains(k) {
             warnings.append("\(key): \"\(k)\" is not supported — ignored")
         }
 
+        if let platform { management += ["--platform", platform] }
         management += ["--label", "\(Compose.projectLabel)=\(project)"]
 
         let plan = ServicePlan(
@@ -821,13 +899,14 @@ enum Compose {
     }
 
     // MARK: helpers
-    /// Parse a compose `build:` value (string context, or a map with context/
-    /// dockerfile/args). Returns nil when there's no build key. Paths resolve
-    /// against the compose file's directory. The produced tag is the explicit
-    /// image if given, else <service>:latest.
+    /// Parse a compose `build:` value (string context, or a map). Returns nil
+    /// when there's no build key. Paths resolve against the compose file's
+    /// directory. The produced tag is the explicit image if given, else
+    /// `<project>-<service>` (docker compose's name for a build-only image).
+    /// Keys the builder can't honor here are named in a warning.
     private static func parseBuild(
-        _ raw: Any?, service: String, project: String, image: String?,
-        baseDir: String?, warnings: inout [String]
+        _ raw: Any?, service: String, project: String, image: String?, platform: String?,
+        baseDir: String?, environment: [String: String], warnings: inout [String]
     ) throws -> BuildSpec? {
         guard let raw else { return nil }
         func abs(_ path: String) -> String {
@@ -835,41 +914,98 @@ enum Compose {
             let base = baseDir ?? FileManager.default.currentDirectoryPath
             return URL(fileURLWithPath: base).appendingPathComponent(path).standardizedFileURL.path
         }
-        var context = "."
+        /// args/labels: list (`K=v`, or a bare `K`) or map (`K: v`, or `K:` with
+        /// no value). A valueless arg takes its value from the environment and
+        /// is dropped when unset (docker compose); a valueless label is empty.
+        func pairs(_ raw: Any?, fromEnvironment: Bool) -> [String] {
+            func entry(_ k: String, _ v: String?) -> String? {
+                if let v { return "\(k)=\(v)" }
+                guard fromEnvironment else { return "\(k)=" }
+                return environment[k].map { "\(k)=\($0)" }
+            }
+            switch raw {
+            case let list as [Any]:
+                return list.map(scalarString).compactMap { item in
+                    guard let eq = item.firstIndex(of: "=") else { return entry(item, nil) }
+                    return entry(String(item[..<eq]), String(item[item.index(after: eq)...]))
+                }
+            case let map as [String: Any]:
+                return map.sorted(by: { $0.key < $1.key }).compactMap { k, v in
+                    v is NSNull ? entry(k, nil) : entry(k, scalarString(v))
+                }
+            default: return []
+            }
+        }
+        func strings(_ raw: Any?) -> [String] {
+            switch raw {
+            case let list as [Any]: return list.map(scalarString)
+            case let one?: return [scalarString(one)]
+            default: return []
+            }
+        }
+        func flag(_ raw: Any?) -> Bool {
+            if let b = raw as? Bool { return b }
+            return raw.map(scalarString) == "true"
+        }
+        var spec = BuildSpec(context: ".", dockerfile: "", tag: image ?? "\(project)-\(service)", args: [])
+        spec.imageIsExplicit = image != nil
         var dockerfile: String? = nil
-        var args: [String] = []
         switch raw {
         case let str as String:
-            context = str
+            spec.context = str
         case let map as [String: Any]:
-            if let c = map["context"] as? String { context = c }
+            if let c = map["context"] as? String { spec.context = c }
             if let d = map["dockerfile"] as? String { dockerfile = d }
-            switch map["args"] {
-            case let list as [Any]: args = list.map(scalarString)
-            case let m as [String: Any]:
-                for (k, v) in m.sorted(by: { $0.key < $1.key }) { args.append("\(k)=\(scalarString(v))") }
-            default: break
+            if let inline = map["dockerfile_inline"] as? String {
+                if dockerfile != nil {
+                    warnings.append("\(service): build.dockerfile and build.dockerfile_inline both set — using dockerfile_inline")
+                }
+                spec.dockerfileInline = inline
             }
-            for k in map.keys where !["context", "dockerfile", "args"].contains(k) {
-                warnings.append("\(service): build.\(k) is not supported — ignored")
+            spec.args = pairs(map["args"], fromEnvironment: true)
+            spec.labels = pairs(map["labels"], fromEnvironment: false)
+            if let t = map["target"] { spec.target = scalarString(t) }
+            spec.noCache = flag(map["no_cache"])
+            spec.pull = flag(map["pull"])
+            spec.tags = strings(map["tags"])
+            spec.platforms = strings(map["platforms"])
+            for p in spec.platforms where BuildService.platform(p) == nil {
+                throw Error.invalidPlatform(service: service, platform: p)
+            }
+            // `network: default` is what the builder does anyway.
+            let handled: Set<String> = [
+                "context", "dockerfile", "dockerfile_inline", "args", "labels", "target",
+                "no_cache", "pull", "tags", "platforms",
+            ]
+            for k in map.keys.sorted() where !handled.contains(k) {
+                if k == "network", scalarString(map[k]!) == "default" { continue }
+                warnings.append("\(service): build.\(k) is not supported by the platform's builder — ignored")
             }
         default:
             warnings.append("\(service): unrecognized build value — ignored")
             return nil
         }
-        let contextAbs = abs(context)
+        // docker compose: a service platform must be among the platforms it
+        // builds; with no build.platforms, it is the one built.
+        if let platform {
+            let wanted = BuildService.platform(platform)
+            if spec.platforms.isEmpty {
+                spec.platforms = [platform]
+            } else if !spec.platforms.contains(where: { BuildService.platform($0) == wanted }) {
+                throw Error.platformNotBuilt(service: service, platform: platform)
+            }
+        }
+        spec.context = abs(spec.context)
         // docker resolves `dockerfile` relative to the CONTEXT dir, not the
         // compose file; an absolute dockerfile is honored as-is.
-        let dockerfileAbs: String
         if let dockerfile {
-            dockerfileAbs = dockerfile.hasPrefix("/")
+            spec.dockerfile = dockerfile.hasPrefix("/")
                 ? dockerfile
-                : URL(fileURLWithPath: contextAbs).appendingPathComponent(dockerfile).standardizedFileURL.path
+                : URL(fileURLWithPath: spec.context).appendingPathComponent(dockerfile).standardizedFileURL.path
         } else {
-            dockerfileAbs = "\(contextAbs)/Dockerfile"
+            spec.dockerfile = "\(spec.context)/Dockerfile"
         }
-        let tag = image ?? "\(service):latest"
-        return BuildSpec(context: contextAbs, dockerfile: dockerfileAbs, tag: tag, args: args)
+        return spec
     }
 
 
@@ -1185,9 +1321,7 @@ extension Compose {
             diagnostic("\(svc.service): \(svc.cliPreview)")
             if let build = svc.build {
                 await progress(.building(service: svc.service), false)
-                _ = try await BuildService.build(BuildService.Request(
-                    contextDir: build.context, dockerfilePath: build.dockerfile,
-                    tag: build.tag, buildArgs: build.args)) { diagnostic($0) }
+                _ = try await BuildService.build(build.request) { diagnostic($0) }
                 await progress(.building(service: svc.service), true)
             }
             if let record = preexisting[svc.name], !record.isRunning {
@@ -1451,10 +1585,16 @@ extension Compose {
         output: @escaping @Sendable (String) -> Void = { print($0, terminator: "") }
     ) async throws {
         for svc in plan.services {
+            // docker compose skips build-only services: their image only
+            // exists once `up` builds it.
+            if let build = svc.build, !build.imageIsExplicit {
+                output("pull: \(svc.service) is built locally — skipped\n")
+                continue
+            }
             await progress(.service(svc.service), false)
             output("pull: \(svc.image)\n")
             let tracker = PullTracker()
-            try await ContainerService.pullImage(svc.image) { events in
+            try await ContainerService.pullImage(svc.image, platform: svc.platform) { events in
                 for line in tracker.consume(events) { output("  \(line)\n") }
             }
             await progress(.service(svc.service), true)
@@ -1736,5 +1876,20 @@ extension Compose {
             }
             try await Task.sleep(for: .seconds(hc.interval))
         }
+    }
+}
+
+extension Compose.BuildSpec {
+    /// The service-layer request this build block describes.
+    var request: BuildService.Request {
+        var request = BuildService.Request(
+            contextDir: context, dockerfilePath: dockerfile, tag: tag,
+            additionalTags: tags, buildArgs: args, labels: labels,
+            noCache: noCache, pull: pull, target: target)
+        request.dockerfileContents = dockerfileInline.map { Data($0.utf8) }
+        // Validated at parse time; an empty list keeps the host default.
+        let parsed = platforms.compactMap(BuildService.platform)
+        if !parsed.isEmpty { request.platforms = parsed }
+        return request
     }
 }

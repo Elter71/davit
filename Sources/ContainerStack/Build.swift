@@ -21,9 +21,17 @@ enum BuildService {
         ContainerizationOCI.Platform(arch: arch, os: "linux")
     }
 
+    /// Parse an `os/arch[/variant]` build platform; nil unless it's a valid
+    /// linux platform (the only OS the builder targets).
+    static func platform(_ spec: String) -> ContainerizationOCI.Platform? {
+        guard let platform = try? ContainerizationOCI.Platform(from: spec), platform.os == "linux" else { return nil }
+        return platform
+    }
+
     struct Request {
         var contextDir: String
         var dockerfilePath: String        // usually <contextDir>/Dockerfile
+        var dockerfileContents: Data? = nil  // inline Dockerfile; dockerfilePath is then unread
         var tag: String                   // e.g. "myapp:latest"
         var additionalTags: [String] = [] // further names for the same image (repeated -t)
         var buildArgs: [String] = []      // KEY=value
@@ -56,10 +64,15 @@ enum BuildService {
         _ request: Request,
         progress: @escaping @Sendable (String) async -> Void
     ) async throws -> String {
-        guard FileManager.default.isReadableFile(atPath: request.dockerfilePath) else {
-            throw CLIError(command: "build \(request.tag)", message: "Dockerfile not found: \(request.dockerfilePath)")
+        let dockerfile: Data
+        if let inline = request.dockerfileContents {
+            dockerfile = inline
+        } else {
+            guard FileManager.default.isReadableFile(atPath: request.dockerfilePath) else {
+                throw CLIError(command: "build \(request.tag)", message: "Dockerfile not found: \(request.dockerfilePath)")
+            }
+            dockerfile = try Data(contentsOf: URL(fileURLWithPath: request.dockerfilePath))
         }
-        let dockerfile = try Data(contentsOf: URL(fileURLWithPath: request.dockerfilePath))
         guard dockerfile.count < maxDockerfileSize else {
             throw CLIError(
                 command: "build \(request.tag)",
