@@ -130,7 +130,7 @@ struct BuildImageSheet: View {
             buildArgs: buildArgs.filter { !$0.key.isEmpty }.map { "\($0.key)=\($0.value)" },
             noCache: noCache,
             pull: pullBase,
-            arch: arch
+            platforms: [BuildService.linuxPlatform(arch: arch)]
         )
         Task {
             do {

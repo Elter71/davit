@@ -16,16 +16,24 @@ enum BuildService {
     /// The host architecture ("arm64" | "amd64") — the build sheet's default.
     static var defaultArch: String { Arch.hostArchitecture().rawValue }
 
+    /// `linux/<arch>` — the only OS the platform builds for.
+    static func linuxPlatform(arch: String) -> ContainerizationOCI.Platform {
+        ContainerizationOCI.Platform(arch: arch, os: "linux")
+    }
+
     struct Request {
         var contextDir: String
         var dockerfilePath: String        // usually <contextDir>/Dockerfile
         var tag: String                   // e.g. "myapp:latest"
+        var additionalTags: [String] = [] // further names for the same image (repeated -t)
         var buildArgs: [String] = []      // KEY=value
         var labels: [String] = []
         var noCache: Bool = false
         var pull: Bool = false            // re-pull base images
         var target: String = ""           // multi-stage target
-        var arch: String = Arch.hostArchitecture().rawValue  // "arm64" | "amd64"
+        /// One entry builds a single-platform image; several build a
+        /// multi-platform index (every variant is unpacked into the store).
+        var platforms: [ContainerizationOCI.Platform] = [linuxPlatform(arch: defaultArch)]
     }
 
     /// Upstream bug apple/container#735: builds with Dockerfiles ≥16 KiB hang.
@@ -48,6 +56,9 @@ enum BuildService {
         _ request: Request,
         progress: @escaping @Sendable (String) async -> Void
     ) async throws -> String {
+        guard FileManager.default.isReadableFile(atPath: request.dockerfilePath) else {
+            throw CLIError(command: "build \(request.tag)", message: "Dockerfile not found: \(request.dockerfilePath)")
+        }
         let dockerfile = try Data(contentsOf: URL(fileURLWithPath: request.dockerfilePath))
         guard dockerfile.count < maxDockerfileSize else {
             throw CLIError(
@@ -68,9 +79,12 @@ enum BuildService {
                 message: "build contexts under /tmp aren't supported by the platform's file sync — move the context to another location (e.g. your home directory)")
         }
 
-        let parsedReference = try Reference.parse(request.tag)
-        parsedReference.normalize()
-        let imageName = parsedReference.description
+        let imageNames = try ([request.tag] + request.additionalTags).map { tag in
+            let reference = try Reference.parse(tag)
+            reference.normalize()
+            return reference.description
+        }
+        let imageName = imageNames[0]
 
         await progress("Connecting to builder…")
         let systemConfig = try await Backend.systemConfig()
@@ -87,8 +101,6 @@ enum BuildService {
         var export = try Builder.BuildExport(from: "type=oci")
         export.destination = exportDir.appendingPathComponent("out.tar")
 
-        let platform = ContainerizationOCI.Platform(arch: request.arch, os: "linux")
-
         await progress("Building \(imageName)…")
         let config = Builder.BuildConfig(
             buildID: buildID,
@@ -104,10 +116,13 @@ enum BuildService {
             dockerignore: dockerignore,
             labels: request.labels,
             noCache: request.noCache,
-            platforms: [platform],
+            platforms: request.platforms,
             terminal: nil,
-            tags: [imageName],
+            tags: imageNames,
             target: request.target,
+            // Never true: in quiet mode BuildStdio drops the shim's stdio
+            // packets without acking them, and the build hangs (1.3.1).
+            // Callers that want silence redirect stderr instead.
             quiet: false,
             exports: [export],
             cacheIn: [],
@@ -127,7 +142,9 @@ enum BuildService {
         }
         for image in result.images {
             try await image.unpack(platform: nil, progressUpdate: { _ in })
-            _ = try await image.tag(new: imageName)
+            for name in imageNames {
+                _ = try await image.tag(new: name)
+            }
         }
         return imageName
     }
