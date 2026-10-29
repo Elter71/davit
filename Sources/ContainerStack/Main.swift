@@ -2538,6 +2538,64 @@ enum SelfTest {
                 }
             }
         }
+        await step("compose: run-flag service keys (labels/tty/init/caps/dns/tmpfs/ulimits/...)") {
+            let plan = try Compose.parse(text: """
+            name: davit-selftest-svckeys
+            services:
+              s:
+                image: alpine:latest
+                tty: true
+                init: true
+                read_only: true
+                cap_add: [NET_ADMIN]
+                cap_drop: [ALL]
+                dns: 1.1.1.1
+                dns_search: [corp.example]
+                dns_opt: [ndots:2]
+                tmpfs: [/run, "/cache:size=64m"]
+                shm_size: 256m
+                labels: { tier: web, empty: null }
+                ulimits:
+                  nproc: 65535
+                  nofile: { soft: 20000, hard: 40000 }
+                  core: { soft: 0 }
+              listlabels:
+                image: alpine:latest
+                labels: [a=1, b=2]
+                tty: false
+            """, projectName: "ignored")
+            let byName = Dictionary(uniqueKeysWithValues: plan.services.map { ($0.service, $0) })
+            guard let s = byName["s"], let l = byName["listlabels"] else {
+                throw CLIError(command: "selftest", message: "service keys: services not parsed")
+            }
+            let wantProcess = ["--tty", "--ulimit", "nofile=20000:40000", "--ulimit", "nproc=65535"]
+            guard s.processArgs.suffix(wantProcess.count).elementsEqual(wantProcess) else {
+                throw CLIError(command: "selftest", message: "service keys process args wrong: \(s.processArgs)")
+            }
+            let wantManagement = [
+                "--init", "--read-only", "--cap-add", "NET_ADMIN", "--cap-drop", "ALL",
+                "--dns", "1.1.1.1", "--dns-search", "corp.example", "--dns-option", "ndots:2",
+                "--tmpfs", "/run", "--tmpfs", "/cache:size=64m", "--shm-size", "256m",
+                "--label", "empty=", "--label", "tier=web",
+                "--label", "\(Compose.projectLabel)=davit-selftest-svckeys",
+            ]
+            guard s.managementArgs == wantManagement else {
+                throw CLIError(command: "selftest", message: "service keys management args wrong: \(s.managementArgs)")
+            }
+            guard l.managementArgs == ["--label", "a=1", "--label", "b=2", "--label", "\(Compose.projectLabel)=davit-selftest-svckeys"],
+                  !l.processArgs.contains("--tty")
+            else { throw CLIError(command: "selftest", message: "list labels / tty:false wrong: \(l.managementArgs) \(l.processArgs)") }
+            // Every mapped key is handled; only read_only's hosts caveat and the
+            // half-specified ulimit warn.
+            guard plan.warnings == [
+                "s: read_only — other service names won't resolve inside this container (its /etc/hosts can't be updated)",
+                "s: ulimits.core needs both soft and hard — ignored",
+            ] else {
+                throw CLIError(command: "selftest", message: "service keys warnings wrong: \(plan.warnings)")
+            }
+            // The argv must be one the run path itself accepts.
+            _ = try ContainerService.parseRunFlags(s.processArgs + s.managementArgs + s.resourceArgs)
+        }
         await step("compose: env_file + entrypoint") {
             let fm = FileManager.default
             let dir = fm.temporaryDirectory.appendingPathComponent("davit-selftest-envfile-\(UUID().uuidString)")
