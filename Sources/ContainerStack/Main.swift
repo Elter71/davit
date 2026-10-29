@@ -3089,10 +3089,10 @@ enum SelfTest {
             let dir = fm.homeDirectoryForCurrentUser.appendingPathComponent(".davit-selftest-buildup-\(UUID().uuidString)")
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
             let container = "davit-selftest-buildup-app"
-            let image = "davit-selftest-buildup-app"
             func cleanup() async {
                 try? await ContainerService.delete(container, force: true)
-                try? await ContainerService.deleteImage(image)
+                // Delete takes the reference as stored: the tag is required.
+                try? await ContainerService.deleteImage("davit-selftest-buildup-app:latest")
                 try? fm.removeItem(at: dir)
             }
             await cleanup()
